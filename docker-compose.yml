@@ -1,0 +1,82 @@
+# ============================================================
+# docker-compose.yml
+# Local development — runs both services together
+# ============================================================
+#
+#  Usage:
+#    docker-compose up --build
+#
+#  The Rust ingester starts first and streams Bybit market data
+#  to Redis AND exposes a fast-lane WebSocket on :8080.
+#  The Python engine connects to both.
+#
+#  Environment variables can be overridden via a .env file
+#  placed in the same directory as this file.
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── Redis ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Rust Bybit Ingester ──────────────────────────────────
+  bybit-ingester:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"          # Fast-lane WebSocket (Python connects here)
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      MAX_SYMBOLS: "${MAX_SYMBOLS:-0}"              # 0 = all symbols
+      SYMBOL_OFFSET: "${SYMBOL_OFFSET:-0}"
+      MESSAGE_BUFFER_SIZE: "${MESSAGE_BUFFER_SIZE:-10000}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ws/BTCUSDT || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Python Micro-Execution Engine ───────────────────────
+  micro-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      bybit-ingester:
+        condition: service_started   # engine falls back gracefully if WS not ready
+    environment:
+      # ── Bybit credentials ──────────────────────────────
+      BYBIT_API_KEY: "${BYBIT_API_KEY}"
+      BYBIT_RSA_PRIVATE_KEY: "${BYBIT_RSA_PRIVATE_KEY}"        # full PEM content
+      BYBIT_RSA_PRIVATE_KEY_PATH: "${BYBIT_RSA_PRIVATE_KEY_PATH:-}"  # alt: path to .pem
+      BYBIT_DEMO: "${BYBIT_DEMO:-false}"
+
+      # ── Engine config ──────────────────────────────────
+      SYMBOL: "${SYMBOL:-BTCUSDT}"
+      RUST_WS_URL: "ws://bybit-ingester:8080"   # primary market-data feed
+      REDIS_URL: "redis://redis:6379"
+
+      # ── Tuning ─────────────────────────────────────────
+      HEDGE_TRIGGER_LOSS_USDT: "${HEDGE_TRIGGER_LOSS_USDT:--15.0}"
+      PROFIT_BUFFER_USDT: "${PROFIT_BUFFER_USDT:-0.5}"
+      POLL_INTERVAL_SEC: "${POLL_INTERVAL_SEC:-3}"

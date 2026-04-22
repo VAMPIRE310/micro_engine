@@ -1,0 +1,54 @@
+# ============================================================
+# railway.toml — Railway multi-service deployment config
+# ============================================================
+#
+#  Two services share one repository:
+#    1. bybit-ingester  (Rust WebSocket market-data engine)
+#    2. micro-engine    (Python AI position manager)
+#
+#  Set all BYBIT_* environment variables in the Railway
+#  dashboard under each service's Variables tab.
+# ============================================================
+
+[build]
+# Root-level build is used by the micro-engine service.
+# The ingester overrides this via its own service config below.
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python main_micro_engine.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# ── bybit-ingester service ───────────────────────────────────
+[[services]]
+name = "bybit-ingester"
+
+[services.build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.rust"
+
+[services.deploy]
+startCommand = "/app/bybit_ingester"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# Expose the fast-lane WebSocket port so micro-engine can reach it
+# via Railway's internal network: http://bybit-ingester.railway.internal:8080
+[[services.ports]]
+port = 8080
+protocol = "tcp"
+
+# ── micro-engine service ─────────────────────────────────────
+[[services]]
+name = "micro-engine"
+
+[services.build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[services.deploy]
+startCommand = "python main_micro_engine.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
