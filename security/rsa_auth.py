@@ -315,69 +315,14 @@ class ResilientConfig:
 class BybitRegion(Enum):
     """All official Bybit API regions with priority order"""
     
-    #EU endpoints
-    EU = ("https://api.bybit.eu", "wss://stream.bybit.eu", "EU", 1)
-    NL = ("https://api.bybit.nl", "wss://stream.bybit.nl", "Netherlands", 2)
     
     # Global primary
     GLOBAL = ("https://api.bybit.com", "wss://stream.bybit.com", "Global", 3)
     BYTICK = ("https://api.bytick.com", "wss://stream.bytick.com", "Bytick", 4)
     
-    # Regional alternatives
-    TURKEY = ("https://api.bybit-tr.com", "wss://stream.bybit-tr.com", "Turkey", 5)
-    KAZAKHSTAN = ("https://api.bybit.kz", "wss://stream.bybit.kz", "Kazakhstan", 6)
-    GEORGIA = ("https://api.bybitgeorgia.ge", "wss://stream.bybitgeorgia.ge", "Georgia", 7)
-    UAE = ("https://api.bybit.ae", "wss://stream.bybit.ae", "UAE", 8)
-    INDONESIA = ("https://api.bybit.id", "wss://stream.bybit.id", "Indonesia", 9)
-    
     # Demo/Paper trading
     DEMO = ("https://api-demo.bybit.com", "wss://stream-demo.bybit.com", "Demo", 10)
 
-class BybitResilientClient:
-    """
-    Production-grade Bybit V5 client with:
-    - Automatic failover across all regions
-    - Hardcoded rate limits (never get banned)
-    - Circuit breakers (don't hammer dead endpoints)
-    - Health tracking (use fastest endpoint)
-    - FSMA compliance (Belgium/EU safe)
-    """
-        
-    def __init__(self, rest_url, ws_url, display_name, priority, config: Optional[ResilientConfig] = None):
-        self.config = config or ResilientConfig()
-        self.rest_url = rest_url
-        self.ws_url = ws_url
-        self.display_name = display_name
-        self.priority = priority
-        
-        # Initialize health tracking for all regions
-        self._health: Dict[BybitRegion, EndpointHealth] = {
-            region: EndpointHealth(region=region)
-            for region in BybitRegion
-        }
-        
-        # Current working endpoint
-        self._current_region: Optional[BybitRegion] = None
-        self._session = requests.Session()
-        
-        # Configure session with retries for connection errors
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=Retry(
-                total=2,
-                backoff_factor=0.5,
-                status_forcelist=[500, 502, 503, 504],
-                allowed_methods=["GET", "POST"]
-            )
-        )
-        self._session.mount("https://", adapter)
-        
-        # Time sync
-        self._time_offset: float = 0.0
-        self._sync_time()
-        
-        logger.info(f"[INIT] Resilient client initialized")
-        logger.info(f"[INIT] Priority regions: {[r.display_name for r in self.config.region_priority]}")
-        
 # ==================== ENUMS ====================
 
 class MarketCategory(Enum):
@@ -473,12 +418,12 @@ class APIConfig:
     API Configuration - RSA Authentication Required
 
     Environment Variables:
-        BYBIT_API_KEY: "28v6ulhXpfSRlj59Wd"
-        BYBIT_RSA_PRIVATE_KEY_PATH: C:\\Users\\VAMPIRE\\OneDrive\\Desktop\\28v6ulhXpfSRlj59Wd_bybit_api.pem
-        BYBIT_RSA_PRIVATE_KEY: RSA private key content (alternative to path)
+        BYBIT_API_KEY: "{{BYBIT_API}}"
+        BYBIT_RSA_PRIVATE_KEY_PATH: "{{BYBIT_RSA_FILE}}" #RAILWAY ENV
+        BYBIT_RSA_PRIVATE_KEY: "{{BYBIT_RSA_PERSONAL}}"
         BYBIT_DEMO: "true" for demo/paper trading (default: true)
     """
-    api_key: str = "28v6ulhXpfSRlj59Wd"
+    api_key: str = None
     api_secret: Optional[str] = None           #The regular API secret
     private_key_path: Optional[str] = r"C:\Users\VAMPIRE\OneDrive\Desktop\28v6ulhXpfSRlj59Wd_bybit_api.pem"     # The RSA Personal KEY .pem file 
     private_key_content: Optional[str] = None  # Alternative to path
