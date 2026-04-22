@@ -1,41 +1,16 @@
-```python
 import os
 import time
 import logging
 import torch
-from pybit.unified_trading import HTTP
-from core.security.rsa_auth import BybitKeyManager
-from core.agents.micro_agent import MicroAgent
+from security.rsa_auth import _shared_client, API_Config, BybitV5Client
+from core.agents.position_manager import position_manager
 
 # Headless Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("MicroEngine")
 
 class MicroExecutionEngine:
-    """
-    Headless Bybit V5 Engine.
-    Strictly forbids closing in a loss. Uses Combined PnL for hedged recovery.
-    """
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.agent = MicroAgent(device="cpu") # Use CPU for lightweight cloud instance
-        
-        # RSA Auth
-        key_mgr = BybitKeyManager()
-        api_key = os.environ.get("BYBIT_API_KEY", "")
-        encrypted_secret = os.environ.get("ENCRYPTED_BYBIT_SECRET", "")
-        if not api_key or not encrypted_secret:
-            raise ValueError("API Key or Encrypted Secret missing in ENV vars.")
-            
-        api_secret = key_mgr.decode_api_secret(encrypted_secret)
-        
-        # Pybit V5 Client
-        self.client = HTTP(
-            testnet=False, 
-            api_key=api_key, 
-            api_secret=api_secret
-        )
-        
+
         # Config
         self.HEDGE_TRIGGER_LOSS_USDT = -15.0 # Example: Hedge if down $15
         self.FEE_RATE = 0.0006 # Conservative Bybit taker fee (0.06%)
