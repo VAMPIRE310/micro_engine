@@ -1,0 +1,168 @@
+```python
+import os
+import time
+import logging
+import torch
+from pybit.unified_trading import HTTP
+from core.security.rsa_auth import BybitKeyManager
+from core.agents.micro_agent import MicroAgent
+
+# Headless Logging Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("MicroEngine")
+
+class MicroExecutionEngine:
+    """
+    Headless Bybit V5 Engine.
+    Strictly forbids closing in a loss. Uses Combined PnL for hedged recovery.
+    """
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.agent = MicroAgent(device="cpu") # Use CPU for lightweight cloud instance
+        
+        # RSA Auth
+        key_mgr = BybitKeyManager()
+        api_key = os.environ.get("BYBIT_API_KEY", "")
+        encrypted_secret = os.environ.get("ENCRYPTED_BYBIT_SECRET", "")
+        if not api_key or not encrypted_secret:
+            raise ValueError("API Key or Encrypted Secret missing in ENV vars.")
+            
+        api_secret = key_mgr.decode_api_secret(encrypted_secret)
+        
+        # Pybit V5 Client
+        self.client = HTTP(
+            testnet=False, 
+            api_key=api_key, 
+            api_secret=api_secret
+        )
+        
+        # Config
+        self.HEDGE_TRIGGER_LOSS_USDT = -15.0 # Example: Hedge if down $15
+        self.FEE_RATE = 0.0006 # Conservative Bybit taker fee (0.06%)
+        log.info(f"🚀 MicroEngine Armed for {self.symbol}.")
+
+    def _estimate_fees(self, pos: dict) -> float:
+        size = float(pos.get('size', 0))
+        entry = float(pos.get('avgPrice', 0))
+        return (size * entry) * self.FEE_RATE
+
+    def get_positions(self):
+        """Fetches active positions from Bybit Unified Trading"""
+        try:
+            res = self.client.get_positions(category="linear", symbol=self.symbol)
+            positions = res.get('result', {}).get('list', [])
+            return [p for p in positions if float(p.get('size', 0)) > 0]
+        except Exception as e:
+            log.error(f"API Error fetching positions: {e}")
+            return []
+
+    def execute_order(self, side: str, qty: float, reduce_only: bool = False):
+        try:
+            res = self.client.place_order(
+                category="linear",
+                symbol=self.symbol,
+                side=side,
+                orderType="Market",
+                qty=str(qty),
+                timeInForce="IOC",
+                reduceOnly=reduce_only
+            )
+            log.info(f"⚡ ORDER EXECUTED: {side} {qty} | ID: {res['result']['orderId']}")
+            return True
+        except Exception as e:
+            log.error(f"Execution failed: {e}")
+            return False
+
+    def check_hedged_resolution(self, positions):
+        """
+        The Combined PnL physical blocker.
+        Only closes if Core + Hedge is profitable after double fees.
+        """
+        if len(positions) < 2:
+            return False
+            
+        pos1, pos2 = positions[0], positions[1]
+        pnl1, pnl2 = float(pos1['unrealisedPnl']), float(pos2['unrealisedPnl'])
+        fee1, fee2 = self._estimate_fees(pos1), self._estimate_fees(pos2)
+        
+        combined_pnl = (pnl1 + pnl2) - (fee1 + fee2)
+        
+        if combined_pnl > 0.5: # 50 cents net profit buffer
+            log.info(f"🎯 [RESOLUTION] Combined PnL positive (${combined_pnl:.2f}). Unwinding both legs.")
+            # Unwind simultaneously
+            self.execute_order("Sell" if pos1['side'] == "Buy" else "Buy", float(pos1['size']), reduce_only=True)
+            self.execute_order("Sell" if pos2['side'] == "Buy" else "Buy", float(pos2['size']), reduce_only=True)
+            
+            # Send positive reward to AI for self-reflection
+            dummy_state = torch.randn(160) # Replace with actual feature engine fetch
+            self.agent.self_reflect(dummy_state, "HEDGE", combined_pnl, dummy_state)
+            return True
+        else:
+            log.debug(f"⏳ [HEDGED] Combined PnL: ${combined_pnl:.2f}. Waiting for resolution.")
+            return False
+
+    def run_loop(self):
+        """Headless cloud polling loop"""
+        while True:
+            try:
+                positions = self.get_positions()
+                
+                # 1. Hedged Resolution Check
+                if len(positions) == 2:
+                    self.check_hedged_resolution(positions)
+                    time.sleep(5)
+                    continue
+
+                # 2. Single Position Management
+                if len(positions) == 1:
+                    core_pos = positions[0]
+                    pnl = float(core_pos['unrealisedPnl'])
+                    side = core_pos['side']
+                    size = float(core_pos['size'])
+                    fees = self._estimate_fees(core_pos)
+                    
+                    # PHYSICAL BLOCKER: Inability to close in a loss
+                    if pnl < 0:
+                        if pnl <= self.HEDGE_TRIGGER_LOSS_USDT:
+                            log.warning(f"🛡️ [DEFENSE] PnL at ${pnl:.2f}. Core in drawdown. Executing Delta-Hedge.")
+                            hedge_side = "Sell" if side == "Buy" else "Buy"
+                            self.execute_order(hedge_side, size) # Open opposing leg
+                        else:
+                            log.debug(f"🔒 [LOCKED] PnL at ${pnl:.2f}. Close blocked by physical rule.")
+                    
+                    # Profit Taking (Let the AI decide if we are in the green)
+                    elif pnl > (fees * 2):
+                        # Fetch fake state for template, replace with real feature engine call
+                        state_tensor = torch.randn(160) 
+                        market_data = {"vol_ratio": 1.2, "near_sr_dist_pct": 0.02}
+                        
+                        action = self.agent.predict(state_tensor, market_data)
+                        if action == "CLOSE_PROFIT":
+                            log.info(f"💰 [PROFIT] AI demands close. PnL: ${pnl:.2f}")
+                            close_side = "Sell" if side == "Buy" else "Buy"
+                            self.execute_order(close_side, size, reduce_only=True)
+                            self.agent.self_reflect(state_tensor, action, pnl, state_tensor)
+
+                # 3. No Positions - Sniping Mode
+                if len(positions) == 0:
+                    state_tensor = torch.randn(160) # Fetch real state
+                    market_data = {"vol_ratio": 1.8, "near_sr_dist_pct": 0.001, "macro_4h_bias": "BULLISH"}
+                    
+                    action = self.agent.predict(state_tensor, market_data)
+                    if action == "ENTRY_LONG":
+                        log.info("🎯 [SNIPE] High-Conviction S/R Breakout. Executing Long.")
+                        self.execute_order("Buy", 0.01) # Replace with dynamic sizing
+                    elif action == "ENTRY_SHORT":
+                        log.info("🎯 [SNIPE] High-Conviction S/R Breakdown. Executing Short.")
+                        self.execute_order("Sell", 0.01)
+
+            except Exception as e:
+                log.error(f"Loop crashed: {e}")
+                
+            time.sleep(3) # Safe rate limit for REST polling on Bybit V5
+
+if __name__ == "__main__":
+    engine = MicroExecutionEngine(symbol="BTCUSDT")
+    engine.run_loop()
+
+```

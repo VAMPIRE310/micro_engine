@@ -1,0 +1,156 @@
+```python
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pyarrow as pa
+import pyarrow.parquet as pq
+import polars as pl
+from typing import Dict, Any
+import logging
+
+log = logging.getLogger("MicroAgent")
+
+class LifecycleNetwork(nn.Module):
+    """Exact match of your local PositionManagerAgent architecture."""
+    def __init__(self, input_dim: int=160, hidden_dim: int=256, num_actions: int=4, num_quantiles: int=32):
+        super().__init__()
+        self.num_actions = num_actions
+        self.num_quantiles = num_quantiles
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc1 = nn.Linear(hidden_dim, 128)
+        self.out = nn.Linear(128, num_actions * num_quantiles)
+
+    def forward(self, x, hidden=None):
+        out, hidden = self.lstm(x, hidden)
+        x = F.relu(self.fc1(out[:, -1, :]))
+        x = self.out(x)
+        # Reshape to [Batch, Actions, Quantiles]
+        return x.view(-1, self.num_actions, self.num_quantiles), hidden
+
+
+class MicroAgent:
+    """
+    Headless LSTM Agent. 
+    Writes transitions via PyArrow. Learns via Polars.
+    """
+    def __init__(self, device="cpu", data_dir="core/data"):
+        self.device = device
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.parquet_path = os.path.join(self.data_dir, "micro_experience.parquet")
+        
+        # Match your local architecture precisely
+        self.model = LifecycleNetwork().to(self.device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        
+        # State tracking for LSTM
+        self.hidden_state = None
+        
+        # PyArrow write buffer
+        self._write_buffer = []
+        self._buffer_limit = 10 # Flush to Parquet every 10 steps
+        
+        log.info(f"🧠 MicroAgent Initialized on {self.device}. Parquet backend ready.")
+
+    def load_weights(self, path: str):
+        """Load your locally trained lifecycle_lstm.pt here"""
+        if os.path.exists(path):
+            self.model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+            log.info(f"✅ Master LSTM Weights Loaded from {path}")
+        else:
+            log.warning(f"⚠️ No weights found at {path}. Operating blind!")
+
+    def reset_sequence(self):
+        """Call this when a trade closes to clear the LSTM's short-term memory."""
+        self.hidden_state = None
+
+    def predict(self, state_tensor: torch.Tensor, market_data: Dict[str, Any]) -> str:
+        """Inference with LSTM Sequence Memory"""
+        self.model.eval()
+        
+        # LSTM expects [Batch, Sequence, Features]
+        state_t = state_tensor.view(1, 1, -1).to(self.device)
+        
+        with torch.no_grad():
+            quantiles, self.hidden_state = self.model(state_t, self.hidden_state)
+            # QR-DQN: Mean across the quantile dimension to get absolute Q-Values
+            q_values = quantiles.mean(dim=2).squeeze(0) 
+            action_idx = torch.argmax(q_values).item()
+            
+        action_map = {0: "HOLD", 1: "HEDGE", 2: "EXIT", 3: "WAVE_ADD"}
+        return action_map.get(action_idx, "HOLD")
+
+    def self_reflect(self, state: torch.Tensor, action: str, reward: float):
+        """
+        PyArrow Buffer -> Parquet Writer.
+        Ultra-low RAM overhead for Railway deployments.
+        """
+        action_map = {"HOLD": 0, "HEDGE": 1, "EXIT": 2, "WAVE_ADD": 3}
+        if action not in action_map: return
+        
+        # Append to RAM buffer
+        self._write_buffer.append({
+            "state": state.cpu().numpy().tolist(),
+            "action": action_map[action],
+            "reward": float(reward)
+        })
+        
+        # Flush to disk via PyArrow when buffer fills
+        if len(self._write_buffer) >= self._buffer_limit:
+            table = pa.Table.from_pylist(self._write_buffer)
+            if os.path.exists(self.parquet_path):
+                # Append to existing
+                existing_table = pq.read_table(self.parquet_path)
+                combined = pa.concat_tables([existing_table, table])
+                pq.write_table(combined, self.parquet_path)
+            else:
+                # Create new
+                pq.write_table(table, self.parquet_path)
+            
+            self._write_buffer.clear()
+            self._trigger_polars_learning()
+
+    def _trigger_polars_learning(self):
+        """
+        Polars Reader -> PyTorch Backward Pass.
+        Loads the most recent N rows directly into vectorized tensors.
+        """
+        if not os.path.exists(self.parquet_path): return
+        
+        try:
+            # 1. Polars: Blazing fast lazy evaluation & tail read
+            df = pl.scan_parquet(self.parquet_path).tail(256).collect()
+            if len(df) < 32: return # Wait for minimum batch size
+            
+            self.model.train()
+            
+            # 2. Extract columns
+            states_list = df["state"].to_list()
+            actions = df["action"].to_numpy()
+            rewards = df["reward"].to_numpy()
+            
+            # 3. Convert to PyTorch Tensors
+            state_t = torch.tensor(states_list, dtype=torch.float32).unsqueeze(1).to(self.device) # [Batch, Seq=1, Features]
+            action_t = torch.tensor(actions, dtype=torch.long).to(self.device)
+            reward_t = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+            
+            # 4. QR-DQN Forward & Loss
+            quantiles, _ = self.model(state_t) # [Batch, Actions, Quantiles]
+            q_values = quantiles.mean(dim=2)   # [Batch, Actions]
+            current_q = q_values.gather(1, action_t.unsqueeze(1)).squeeze(1)
+            
+            loss = F.smooth_l1_loss(current_q, reward_t)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            log.debug(f"🎓 Online Learning Cycle Complete. Loss: {loss.item():.4f}")
+            
+        except Exception as e:
+            log.error(f"Polars Learning Loop Failed: {e}")
+
+
+```

@@ -1,0 +1,31 @@
+```dockerfile
+# Use slim Python 3.11 for a lightweight, fast Railway container
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies required for cryptography, PyTorch, and compiling
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first to leverage Docker layer caching
+COPY requirements.txt .
+
+# Install Python dependencies (no-cache to save image space)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of your trading bot's source code
+COPY . .
+
+# Set environment variables to optimize Python execution and PyTorch
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=4
+
+# Run the headless execution script
+CMD ["python", "main_micro_engine.py"]
+
+```
