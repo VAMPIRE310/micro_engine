@@ -1,0 +1,28 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# merged_models/ weights are for the position manager (not used by main engine).
+# lifecycle_lstm.pt in the root IS used by main_micro_engine.py — do NOT exclude it.
+merged_models/
+
+# Rust build artifacts
+bybit_ingester/target/
+
+# Misc
+*.txt.bak
+*.log
+.DS_Store
+Thumbs.db
