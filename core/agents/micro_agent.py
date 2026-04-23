@@ -55,8 +55,12 @@ class MicroAgent:
     _ACTION_MAP = {0: "HOLD", 1: "HEDGE", 2: "EXIT", 3: "WAVE_ADD"}
     _ACTION_IDX = {"HOLD": 0, "HEDGE": 1, "EXIT": 2, "WAVE_ADD": 3}
 
-    def __init__(self, device: str = "cpu", data_dir: str = "core/data"):
-        self.device = device
+    def __init__(self, device: str = "auto", data_dir: str = "core/data"):
+        # Resolve "auto" → CUDA if available, else CPU
+        if device == "auto" or device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         parquet_path = os.path.join(self.data_dir, "micro_experience.parquet")

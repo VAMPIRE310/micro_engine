@@ -175,8 +175,22 @@ def _ws_auth_payload(config: APIConfig) -> dict:
 
 class MarketDataStream:
     """
-    Connects to the Rust engine WS for a single symbol.
-    Falls back to Bybit public WS if Rust is unreachable.
+    Multi-tier market data feed for a single symbol.
+
+    Connection priority (tried in order, cycling indefinitely):
+      1. Rust engine WS  (ws://{RUST_WS_URL}/ws/{symbol})
+         — lowest latency, includes kline pub/sub bridge data
+      2. Bybit private RSA-authenticated WS — tickers.{symbol}
+         — requires api_config; delivers real-time best bid/ask + last price
+         — used while Rust is recovering; RSA-signed so it works even if the
+           public WS is geo-blocked or rate-limited
+      3. Bybit public WS — publicTrade.{symbol}
+         — unauthenticated fallback; delivers individual fills (true CVD input)
+      4. REST polling — GET /v5/market/tickers every 1 s
+         — last resort; always available as long as any Bybit region is reachable
+
+    When Rust comes back online after any fallback, the loop automatically
+    promotes back to tier-1 on the next reconnect cycle.
 
     Ticks are throttled to one accepted update per 100 ms.
     tick_event (asyncio.Event) is set on every accepted tick so the
@@ -186,7 +200,12 @@ class MarketDataStream:
     when a position opens; call stop() when the last position closes.
     """
 
-    def __init__(self, symbol: str, rust_base_url: str):
+    _RUST_RETRY_INTERVAL = 30.0   # how often to re-probe Rust while on a fallback
+    _REST_POLL_INTERVAL  = 1.0    # REST polling cadence (tier 4)
+    _BACKOFF_MAX         = 60.0   # maximum reconnect back-off per tier
+
+    def __init__(self, symbol: str, rust_base_url: str,
+                 api_config: Optional["APIConfig"] = None):
         self.symbol = symbol
         self.rust_url = f"{rust_base_url}/ws/{symbol}"
         self.bybit_public_url = BYBIT_PUBLIC_WS
@@ -194,20 +213,63 @@ class MarketDataStream:
         self._running = False
         self._last_emit_ts: float = 0.0        # monotonic clock; throttle anchor
         self.tick_event: asyncio.Event = asyncio.Event()
+        self._api_config = api_config          # needed for tier-2 and tier-4
 
     async def run(self) -> None:
         if self._running:
             return   # guard against duplicate asyncio.create_task() calls
         self._running = True
         log.info("[MarketData] Stream starting for %s", self.symbol)
+
         while self._running:
+            # ── Tier 1: Rust engine ────────────────────────────────────────
             connected = await self._try_rust()
-            if not connected:
-                log.warning("[MarketData] Rust WS unavailable — falling back to Bybit public WS")
-                await self._run_bybit_public()
+            if not self._running:
+                break
+            if connected:
+                # Rust was running but exited cleanly — tight-loop retry
+                continue
+
+            log.warning("[MarketData] Rust WS unavailable — trying RSA private WS (tier 2)")
+
+            # ── Tier 2: Bybit private RSA WS ──────────────────────────────
+            if self._api_config is not None:
+                rust_back = await self._run_private_rsa(probe_rust_every=self._RUST_RETRY_INTERVAL)
+                if not self._running:
+                    break
+                if rust_back:
+                    log.info("[MarketData] Rust back online — promoting from tier-2 to tier-1")
+                    continue    # next loop iteration will hit _try_rust()
+
+            log.warning("[MarketData] RSA private WS failed — trying Bybit public WS (tier 3)")
+
+            # ── Tier 3: Bybit public WS ────────────────────────────────────
+            rust_back = await self._run_bybit_public(probe_rust_every=self._RUST_RETRY_INTERVAL)
+            if not self._running:
+                break
+            if rust_back:
+                log.info("[MarketData] Rust back online — promoting from tier-3 to tier-1")
+                continue
+
+            log.warning("[MarketData] Public WS failed — falling back to REST polling (tier 4)")
+
+            # ── Tier 4: REST polling ───────────────────────────────────────
+            rust_back = await self._run_rest_polling(probe_rust_every=self._RUST_RETRY_INTERVAL)
+            if not self._running:
+                break
+            if rust_back:
+                log.info("[MarketData] Rust back online — promoting from tier-4 to tier-1")
+
+        log.info("[MarketData] Stream stopped for %s", self.symbol)
+
+    # ── Tier 1 ──────────────────────────────────────────────────────────────
 
     async def _try_rust(self) -> bool:
-        """Attempt one connection to the Rust WS. Returns True on clean connect."""
+        """
+        Attempt one connection to the Rust WS.
+        Returns True if it connected and then disconnected cleanly (so the
+        caller can tight-loop back to tier-1), False if it never connected.
+        """
         try:
             import websockets
             async with websockets.connect(
@@ -216,60 +278,221 @@ class MarketDataStream:
                 ping_timeout=10,
             ) as ws:
                 log.info("[MarketData] Connected to Rust engine: %s", self.rust_url)
-                # Rust engine streams all data automatically — no subscribe needed.
                 async for raw in ws:
+                    if not self._running:
+                        return True
                     try:
                         msg = json.loads(raw)
                         self._ingest(msg)
                     except Exception:
                         pass
+                # Clean EOF — treat as connected (will re-enter loop)
+                return True
         except Exception as exc:
             log.debug("[MarketData] Rust WS connect failed: %s", exc)
             return False
-        return True
 
-    async def _run_bybit_public(self) -> None:
-        """
-        Fallback: subscribe to publicTrade.{symbol} on Bybit public WS.
+    # ── Tier 2: Bybit private RSA-authenticated WS ───────────────────────
 
-        Uses publicTrade (not tickers) because it delivers real per-trade price
-        and size — exactly what the HybridVolumeTrailingStop needs for its
-        micro-VWAP and volume-surge detector.  All messages are routed through
-        _ingest() so the 100 ms throttle and tick_event both apply identically
-        to the Rust-engine path.
+    async def _run_private_rsa(self, probe_rust_every: float) -> bool:
         """
+        Subscribe to tickers.{symbol} on the Bybit private WS (RSA-signed).
+
+        Returns True as soon as a background probe confirms Rust is back.
+        Returns False if the WS itself errors — caller should try tier 3.
+        """
+        _PRIVATE_URL = BYBIT_PRIVATE_WS_DEMO if self._api_config.demo else BYBIT_PRIVATE_WS_LIVE
+        backoff = 2.0
+        rust_back = False
+
+        while self._running and not rust_back:
+            try:
+                import websockets
+                async with websockets.connect(
+                    _PRIVATE_URL, ping_interval=None
+                ) as ws:
+                    # Authenticate
+                    try:
+                        auth = _ws_auth_payload(self._api_config)
+                        await ws.send(json.dumps(auth))
+                        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        resp = json.loads(raw)
+                        if not resp.get("success"):
+                            log.warning("[MarketData] Private WS auth failed: %s — skipping tier-2", resp)
+                            return False
+                    except Exception as auth_exc:
+                        log.warning("[MarketData] Private WS auth error: %s — skipping tier-2", auth_exc)
+                        return False
+
+                    # Subscribe to tickers (contains lastPrice + bid/ask)
+                    sub = {"op": "subscribe", "args": [f"tickers.{self.symbol}"]}
+                    await ws.send(json.dumps(sub))
+                    log.info("[MarketData] Subscribed to Bybit private tickers.%s (tier-2)", self.symbol)
+                    backoff = 2.0
+
+                    heartbeat = asyncio.create_task(self._heartbeat(ws))
+                    rust_probe = asyncio.create_task(self._probe_rust_loop(probe_rust_every))
+                    try:
+                        async for raw in ws:
+                            if not self._running:
+                                return False
+                            # Check if Rust came back
+                            if rust_probe.done() and rust_probe.result():
+                                return True
+                            try:
+                                msg = json.loads(raw)
+                                if msg.get("topic", "").startswith("tickers."):
+                                    data = msg.get("data", {})
+                                    price = float(data.get("lastPrice", 0) or 0)
+                                    if price > 0:
+                                        self._ingest({"type": "tick", "price": price, "size": 0})
+                            except Exception:
+                                pass
+                    finally:
+                        heartbeat.cancel()
+                        rust_back = rust_probe.done() and rust_probe.result()
+                        rust_probe.cancel()
+
+            except Exception as exc:
+                log.error("[MarketData] Private WS error: %s — backoff %.1fs", exc, backoff)
+                await asyncio.sleep(min(backoff, self._BACKOFF_MAX))
+                backoff = min(backoff * 2, self._BACKOFF_MAX)
+
+                # Check if Rust recovered while we were sleeping
+                if await self._probe_rust_once():
+                    return True
+
+        return rust_back
+
+    # ── Tier 3: Bybit public WS ──────────────────────────────────────────
+
+    async def _run_bybit_public(self, probe_rust_every: float) -> bool:
+        """
+        Subscribe to publicTrade.{symbol} on the Bybit public WS.
+
+        Returns True as soon as a background probe confirms Rust is back.
+        Returns False if the WS itself errors — caller should try tier 4.
+        """
+        backoff = 2.0
+        rust_back = False
+
+        while self._running and not rust_back:
+            try:
+                import websockets
+                async with websockets.connect(
+                    self.bybit_public_url,
+                    ping_interval=15,
+                    ping_timeout=10,
+                ) as ws:
+                    sub = {"op": "subscribe", "args": [f"publicTrade.{self.symbol}"]}
+                    await ws.send(json.dumps(sub))
+                    log.info("[MarketData] Subscribed to Bybit publicTrade.%s (tier-3)", self.symbol)
+                    backoff = 2.0
+
+                    heartbeat = asyncio.create_task(self._heartbeat(ws))
+                    rust_probe = asyncio.create_task(self._probe_rust_loop(probe_rust_every))
+                    try:
+                        async for raw in ws:
+                            if not self._running:
+                                return False
+                            if rust_probe.done() and rust_probe.result():
+                                return True
+                            try:
+                                msg = json.loads(raw)
+                                if msg.get("topic", "").startswith("publicTrade."):
+                                    for trade in msg.get("data", []):
+                                        self._ingest({
+                                            "type":  "trade",
+                                            "price": trade.get("p", 0),
+                                            "size":  trade.get("v", 0),
+                                        })
+                            except Exception:
+                                pass
+                    finally:
+                        heartbeat.cancel()
+                        rust_back = rust_probe.done() and rust_probe.result()
+                        rust_probe.cancel()
+
+            except Exception as exc:
+                log.error("[MarketData] Public WS error: %s — backoff %.1fs", exc, backoff)
+                await asyncio.sleep(min(backoff, self._BACKOFF_MAX))
+                backoff = min(backoff * 2, self._BACKOFF_MAX)
+                if await self._probe_rust_once():
+                    return True
+
+        return rust_back
+
+    # ── Tier 4: REST polling ─────────────────────────────────────────────
+
+    async def _run_rest_polling(self, probe_rust_every: float) -> bool:
+        """
+        Poll Bybit REST /v5/market/tickers every REST_POLL_INTERVAL seconds.
+        Returns True as soon as a probe confirms Rust is back.
+        """
+        import aiohttp
+
+        _BYBIT_REST_TICKERS = "https://api.bybit.com/v5/market/tickers"
+        last_rust_probe = time.monotonic()
+
+        log.info("[MarketData] REST polling started for %s (tier-4)", self.symbol)
+        while self._running:
+            now = time.monotonic()
+
+            # Periodic Rust probe
+            if now - last_rust_probe >= probe_rust_every:
+                last_rust_probe = now
+                if await self._probe_rust_once():
+                    log.info("[MarketData] Rust back online — leaving REST polling")
+                    return True
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        _BYBIT_REST_TICKERS,
+                        params={"category": "linear", "symbol": self.symbol},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        body = await resp.json()
+                        items = body.get("result", {}).get("list", [])
+                        if items:
+                            item = items[0]
+                            price = float(item.get("lastPrice", 0) or 0)
+                            if price > 0:
+                                self._ingest({"type": "tick", "price": price, "size": 0})
+            except Exception as exc:
+                log.debug("[MarketData] REST poll error: %s", exc)
+
+            await asyncio.sleep(self._REST_POLL_INTERVAL)
+
+        return False
+
+    # ── Background Rust probe helpers ────────────────────────────────────
+
+    async def _probe_rust_loop(self, interval: float) -> bool:
+        """
+        Await `interval` seconds then attempt a single Rust probe.
+        Returns True if Rust responded.  Designed to be run as a Task
+        alongside a WS message loop so it fires once per interval.
+        """
+        await asyncio.sleep(interval)
+        return await self._probe_rust_once()
+
+    async def _probe_rust_once(self) -> bool:
+        """One-shot Rust connectivity check (low timeout, no data ingestion)."""
         try:
             import websockets
             async with websockets.connect(
-                self.bybit_public_url,
-                ping_interval=15,
-                ping_timeout=10,
+                self.rust_url,
+                open_timeout=3,
+                ping_interval=None,
             ) as ws:
-                sub = {"op": "subscribe", "args": [f"publicTrade.{self.symbol}"]}
-                await ws.send(json.dumps(sub))
-                log.info("[MarketData] Subscribed to Bybit publicTrade.%s", self.symbol)
+                # Just connecting is enough to confirm Rust is alive
+                await ws.close()
+            return True
+        except Exception:
+            return False
 
-                ping_task = asyncio.create_task(self._heartbeat(ws))
-                try:
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                            if msg.get("topic", "").startswith("publicTrade."):
-                                for trade in msg.get("data", []):
-                                    # Normalise to Rust-engine format so _ingest()
-                                    # handles throttle and tick_event uniformly.
-                                    self._ingest({
-                                        "type":  "trade",
-                                        "price": trade.get("p", 0),
-                                        "size":  trade.get("v", 0),
-                                    })
-                        except Exception:
-                            pass
-                finally:
-                    ping_task.cancel()
-        except Exception as exc:
-            log.error("[MarketData] Bybit public WS error: %s — retrying in 5s", exc)
-            await asyncio.sleep(5)
+    # ── Shared helpers ───────────────────────────────────────────────────
 
     async def _heartbeat(self, ws) -> None:
         while True:
@@ -620,13 +843,13 @@ class MicroExecutionEngine:
         self.client = BybitV5Client(config=api_config)
         self._api_config = api_config
 
-        # AI agent
-        self.agent = MicroAgent(device="cpu")
+        # AI agent — device auto-detects CUDA when available, else CPU
+        self.agent = MicroAgent(device="auto")
         self.agent.load_weights(WEIGHTS_PATH)
 
-        # Market data stream (Rust primary / Bybit public fallback).
+        # Market data stream (Rust primary / RSA private WS / public WS / REST fallback).
         # NOT started here — started dynamically when a live position is detected.
-        self.market = MarketDataStream(symbol, RUST_WS_URL)
+        self.market = MarketDataStream(symbol, RUST_WS_URL, api_config=api_config)
 
         # Private stream (positions + executions + orders + wallet — all live)
         self.private_ws = PrivateStream(api_config)

@@ -26,6 +26,8 @@ pyarrow>=15.0,<17.0
 # -----------------------------------------------------------
 requests>=2.31,<3.0
 urllib3>=2.0,<3.0
+# aiohttp — async HTTP client used for REST polling fallback (tier-4 market data)
+aiohttp>=3.13.3,<4.0
 
 # -----------------------------------------------------------
 # WebSocket (two libs — sync + async, both used in rsa_auth)
