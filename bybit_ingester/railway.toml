@@ -1,0 +1,15 @@
+# ============================================================
+# railway.toml — Bybit Ingester (Rust)
+#
+# In the Railway dashboard, set this service's "Config File Path"
+# to:  bybit_ingester/railway.toml
+# ============================================================
+
+[build]
+builder      = "dockerfile"
+dockerfilePath = "Dockerfile.rust"
+
+[deploy]
+startCommand         = "/app/bybit_ingester"
+restartPolicyType    = "on_failure"
+restartPolicyMaxRetries = 10
