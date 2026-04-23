@@ -499,11 +499,20 @@ class APIConfig:
             demo_env = os.environ.get('BYBIT_DEMO', 'true').lower()
             self.demo = demo_env in ('true', '1', 'yes', 'on')
         
-        # Validation
+        # Validation — warn rather than raise so the container can start without
+        # credentials and fail at the first authenticated request instead of at
+        # import / instantiation time.
         if not self.api_key:
-            raise ValueError("BYBIT_API_KEY is required")
+            logger.warning(
+                "BYBIT_API_KEY is not set — authenticated requests will be rejected by Bybit. "
+                "Set the BYBIT_API_KEY environment variable before the engine connects."
+            )
         if not self.private_key_path and not self.private_key_content:
-            raise ValueError("BYBIT_PRIVATE_KEY or BYBIT_PRIVATE_KEY_PATH is required")
+            logger.warning(
+                "Neither BYBIT_RSA_PRIVATE_KEY nor BYBIT_RSA_PRIVATE_KEY_PATH is set — "
+                "RSA-signed requests and WebSocket authentication will fail. "
+                "Set one of those environment variables before the engine connects."
+            )
 
 @dataclass
 class TickerData:

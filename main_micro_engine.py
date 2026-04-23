@@ -1563,7 +1563,20 @@ class MicroExecutionEngine:
 # ===========================================================================
 
 if __name__ == "__main__":
-    engine = MicroExecutionEngine(symbol=SYMBOL)
+    # Emit a clear startup diagnostic for the two most common mis-configurations
+    # so Railway / Docker logs point directly at the missing variable.
+    if not os.environ.get("BYBIT_API_KEY", "").strip():
+        log.critical(
+            "BYBIT_API_KEY environment variable is not set. "
+            "The engine will start but all authenticated Bybit requests will fail. "
+            "Set BYBIT_API_KEY (and BYBIT_RSA_PRIVATE_KEY or BYBIT_RSA_PRIVATE_KEY_PATH) "
+            "before deploying."
+        )
+    try:
+        engine = MicroExecutionEngine(symbol=SYMBOL)
+    except Exception as exc:  # pragma: no cover
+        log.critical("Failed to initialise MicroExecutionEngine: %s", exc, exc_info=True)
+        raise SystemExit(1)
     try:
         asyncio.run(engine.run())
     except KeyboardInterrupt:
