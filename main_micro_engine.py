@@ -281,6 +281,10 @@ class PrivateStream:
         on_execution(data: list)  — fill/execution updates
         on_order(data: list)      — order status updates
         on_wallet(data: list)     — wallet / equity updates
+        on_reconnect()            — async coroutine called after every successful
+                                    auth, covering both startup and reconnects after
+                                    drops.  Used by the engine to resync position
+                                    state via REST when the live stream comes back.
     """
 
     def __init__(self, config: APIConfig):
@@ -291,6 +295,7 @@ class PrivateStream:
         self.on_execution = None
         self.on_order     = None
         self.on_wallet    = None
+        self.on_reconnect = None   # async coroutine
 
     async def run(self) -> None:
         self._running = True
@@ -325,6 +330,11 @@ class PrivateStream:
                     await ws.send(json.dumps(sub))
 
                     backoff = 1.0   # reset on successful connect
+
+                    # Fire reconnect callback so the engine can resync position
+                    # state via REST (covers startup and reconnects after drops).
+                    if self.on_reconnect:
+                        asyncio.create_task(self.on_reconnect())
 
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     try:
@@ -591,6 +601,7 @@ class MicroExecutionEngine:
         self.private_ws.on_execution = self._on_execution_update
         self.private_ws.on_order     = self._on_order_update
         self.private_ws.on_wallet    = self._on_wallet_update
+        self.private_ws.on_reconnect = self._rest_sync_positions
 
         # Trade WS — RSA-signed order placement, no REST for orders
         self.trade_ws = TradeStream(api_config)
@@ -921,17 +932,13 @@ class MicroExecutionEngine:
         instead of sleeping a fixed interval.  Falls back to a 1 s timeout to
         handle the rare case where a position update arrives while the market
         stream is not yet connected.  No polling.
+
+        Position state is populated entirely by the private WS callbacks
+        (_on_position_update) and by _rest_sync_positions which fires on every
+        private WS (re)connect — no manual startup call needed here.
         """
-        # One-time REST sync to pick up positions already open at startup
-        await self._initial_rest_sync()
-
-        # If startup sync found positions, subscribe to market data immediately
-        if self._agent_active and not self.market._running:
-            asyncio.create_task(self.market.run())
-
         while True:
             try:
-                # Block until the next throttled tick (or 1 s timeout as safety net)
                 try:
                     await asyncio.wait_for(self.market.tick_event.wait(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -939,7 +946,6 @@ class MicroExecutionEngine:
                 finally:
                     self.market.tick_event.clear()
 
-                # Keep rolling price buffer up-to-date
                 price = self.market.last_tick["price"]
                 if price > 0:
                     self._price_buffers[self.symbol].append(price)
@@ -954,13 +960,25 @@ class MicroExecutionEngine:
             except Exception as exc:
                 log.error("[Loop] Unhandled error: %s", exc)
 
-    async def _initial_rest_sync(self) -> None:
-        """Fetch current positions via REST — called once on startup only."""
+    async def _rest_sync_positions(self) -> None:
+        """
+        REST position resync — called by PrivateStream on every successful
+        (re)connect so the engine never has stale state after a WS drop.
+
+        Fetches both hedge legs (Long positionIdx=1, Short positionIdx=2) for
+        the tracked symbol and merges them into self._positions.  Any leg with
+        size=0 is treated as closed and removed.  Does NOT reset session_realized
+        so cumulative PnL memory survives reconnects.
+        """
         try:
+            log.info("[Sync] REST position resync triggered (WS reconnect).")
             positions = self.client.get_positions(category="linear", symbol=self.symbol)
-            for sym, pos in positions.items():
+            seen_idxs = set()
+            for pos in positions.values():
+                idx = pos.position_idx
+                seen_idxs.add(idx)
                 if pos.size > 0:
-                    raw = {
+                    self._positions[idx] = {
                         "symbol":        pos.symbol,
                         "side":          pos.side,
                         "size":          str(pos.size),
@@ -968,16 +986,37 @@ class MicroExecutionEngine:
                         "unrealisedPnl": str(pos.unrealized_pnl),
                         "cumRealisedPnl": str(pos.realized_pnl),
                         "positionIdx":   str(pos.position_idx),
+                        "leverage":      str(pos.leverage),
+                        "positionBalance": str(pos.position_balance),
                     }
-                    idx = pos.position_idx
-                    self._positions[idx] = raw
                     log.info(
-                        "[Startup] Found existing position idx=%d side=%s size=%s",
-                        idx, pos.side, pos.size,
+                        "[Sync] Position idx=%d side=%s size=%s entry=%.4f",
+                        idx, pos.side, pos.size, pos.entry_price,
                     )
+                    # Arm trailing stop if not already armed
+                    if idx not in self._trailing_stops and pos.entry_price > 0:
+                        direction = (TrailingDirection.LONG if pos.side == "Buy"
+                                     else TrailingDirection.SHORT)
+                        self._trailing_stops[idx] = HybridVolumeTrailingStop(
+                            symbol=self.symbol,
+                            config=HybridStopConfig(direction=direction, entry_price=pos.entry_price),
+                        )
+                else:
+                    # Flat leg — remove if we had it tracked
+                    self._positions.pop(idx, None)
+                    self._trailing_stops.pop(idx, None)
+
             self._agent_active = len(self._positions) > 0
+
+            # Start market data stream if we have live positions and it's not running
+            if self._agent_active and not self.market._running:
+                asyncio.create_task(self.market.run())
+            elif not self._agent_active and self.market._running:
+                self.market.stop()
+
+            log.info("[Sync] Done — %d active position(s).", len(self._positions))
         except Exception as exc:
-            log.error("[Startup] REST sync failed: %s — relying on WS updates.", exc)
+            log.error("[Sync] REST resync failed: %s — live WS will self-correct.", exc)
 
     # ── Entry point ──────────────────────────────────────────────────────────
 
@@ -987,7 +1026,7 @@ class MicroExecutionEngine:
         log.info("All data paths: LIVE WebSocket only (no polling).")
 
         # Market stream is NOT included here — it starts dynamically in
-        # _on_position_update / _initial_rest_sync when a live position exists.
+        # _on_position_update / _rest_sync_positions when a live position exists.
         await asyncio.gather(
             self.private_ws.run(),
             self.trade_ws.run(),
