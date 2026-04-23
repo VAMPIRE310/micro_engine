@@ -1,54 +1,20 @@
 # ============================================================
-# railway.toml — Railway multi-service deployment config
-# ============================================================
+# railway.toml — Python Micro-Execution Engine
 #
-#  Two services share one repository:
-#    1. bybit-ingester  (Rust WebSocket market-data engine)
-#    2. micro-engine    (Python AI position manager)
+# This file configures the "micro-engine" Railway service.
+# It is read by Railway for whichever service has its
+# "Config File Path" set to "railway.toml" (the default).
 #
-#  Set all BYBIT_* environment variables in the Railway
-#  dashboard under each service's Variables tab.
+# For the Rust bybit-ingester service, point its
+# "Config File Path" (Railway dashboard → Settings → Build)
+# to:  bybit_ingester/railway.toml
 # ============================================================
 
 [build]
-# Root-level build is used by the micro-engine service.
-# The ingester overrides this via its own service config below.
-builder = "dockerfile"
+builder        = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python main_micro_engine.py"
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
-
-# ── bybit-ingester service ───────────────────────────────────
-[[services]]
-name = "bybit-ingester"
-
-[services.build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile.rust"
-
-[services.deploy]
-startCommand = "/app/bybit_ingester"
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
-
-# Expose the fast-lane WebSocket port so micro-engine can reach it
-# via Railway's internal network: http://bybit-ingester.railway.internal:8080
-[[services.ports]]
-port = 8080
-protocol = "tcp"
-
-# ── micro-engine service ─────────────────────────────────────
-[[services]]
-name = "micro-engine"
-
-[services.build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
-[services.deploy]
-startCommand = "python main_micro_engine.py"
-restartPolicyType = "on_failure"
+startCommand            = "python main_micro_engine.py"
+restartPolicyType       = "on_failure"
 restartPolicyMaxRetries = 10

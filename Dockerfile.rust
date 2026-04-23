@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy Cargo manifest + lock file first so dependency layer is cached
 # independently of source changes.
-COPY bybit_ingester/Cargo.toml ./Cargo.toml
+COPY bybit_ingester/Cargo.toml  ./Cargo.toml
+COPY bybit_ingester/Cargo.lock  ./Cargo.lock
 
 # Dummy main.rs so `cargo build --release` fetches & compiles all deps.
 # The real source replaces it in the next COPY step.
@@ -24,11 +25,11 @@ RUN mkdir src && echo 'fn main(){}' > src/main.rs \
     && cargo build --release \
     && rm -f target/release/deps/bybit_ingester*
 
-# Now copy the real source files
-COPY bybit_ingester/main.rs      src/main.rs
-COPY bybit_ingester/websocket.rs src/websocket.rs
-COPY bybit_ingester/orderbook.rs src/orderbook.rs
-COPY bybit_ingester/metrics.rs   src/metrics.rs
+# Now copy the real source files (they live in bybit_ingester/src/)
+COPY bybit_ingester/src/main.rs      src/main.rs
+COPY bybit_ingester/src/websocket.rs src/websocket.rs
+COPY bybit_ingester/src/orderbook.rs src/orderbook.rs
+COPY bybit_ingester/src/metrics.rs   src/metrics.rs
 
 # Final release build (only recompiles changed crates)
 RUN cargo build --release

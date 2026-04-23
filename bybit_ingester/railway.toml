@@ -1,0 +1,25 @@
+# ============================================================
+# railway.toml — Bybit Ingester (Rust)
+#
+# In the Railway dashboard, set this service's "Config File Path"
+# to:  bybit_ingester/railway.toml
+#
+# Railway uses the multi-stage Dockerfile.rust to compile the
+# Rust binary in a full Rust image, then copies it into a slim
+# Debian runtime — keeping the deployed image tiny.
+#
+# Alternative (no Dockerfile needed):
+#   Set the service Root Directory to "bybit_ingester/" and let
+#   Railway's native Railpack builder auto-detect Cargo.toml.
+#   The nixpacks.toml in that directory supplies the required
+#   system packages (pkg-config, openssl).
+# ============================================================
+
+[build]
+builder        = "dockerfile"
+dockerfilePath = "Dockerfile.rust"
+
+[deploy]
+startCommand            = "/app/bybit_ingester"
+restartPolicyType       = "on_failure"
+restartPolicyMaxRetries = 10
