@@ -90,6 +90,26 @@ HEDGE_TRIGGER_LOSS = float(os.environ.get("HEDGE_TRIGGER_LOSS_USDT", "-15.0"))
 PROFIT_BUFFER = float(os.environ.get("PROFIT_BUFFER_USDT", "0.5"))
 FEE_RATE = 0.0006   # Bybit taker fee 0.06 % — conservative
 
+# Hedge sizing: 1.0 = delta-neutral (same qty as losing leg).
+# Set > 1.0 to flip net delta toward the hedge direction.
+HEDGE_SIZE_MULTIPLIER = float(os.environ.get("HEDGE_SIZE_MULTIPLIER", "1.0"))
+
+# Profit-run gate: only close a profitable position after it has pulled back
+# this fraction from its peak unrealised PnL.  0.25 = close when 25 % of
+# peak profit has been given back (i.e. let the winner run, catch the turn).
+PROFIT_DRAWDOWN_PCT = float(os.environ.get("PROFIT_DRAWDOWN_PCT", "0.25"))
+
+# Survival mode — triggered when a hedge order is rejected due to margin.
+# The engine then reduces the losing leg in chunks to free margin and retries.
+SURVIVAL_REDUCE_PCT      = float(os.environ.get("SURVIVAL_REDUCE_PCT", "0.20"))
+SURVIVAL_REDUCE_INTERVAL = float(os.environ.get("SURVIVAL_REDUCE_INTERVAL_SEC", "2.0"))
+SURVIVAL_RECHECK_INTERVAL = float(os.environ.get("SURVIVAL_RECHECK_INTERVAL_SEC", "30.0"))
+CONTINUATION_TICKS       = int(os.environ.get("CONTINUATION_TICKS", "10"))
+MIN_ORDER_QTY            = float(os.environ.get("MIN_ORDER_QTY", "0.001"))
+
+# Bybit error codes that mean "insufficient margin / balance"
+_MARGIN_ERROR_CODES = frozenset({110007, 110012, 110014})
+
 BYBIT_PUBLIC_WS       = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_PRIVATE_WS_LIVE = "wss://stream.bybit.com/v5/private"
 BYBIT_PRIVATE_WS_DEMO = "wss://stream-demo.bybit.com/v5/private"
