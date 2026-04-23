@@ -2243,7 +2243,7 @@ class BybitV5Client:
                         occ_closing_fee=safe_float(item.get('occClosingFee')),
                         occ_funding_fee=safe_float(item.get('occFundingFee'))
                     )
-                    positions[position.symbol] = position
+                    positions[f"{position.symbol}_{position.position_idx}"] = position
             
             with self._data_lock:
                 self.positions.update(positions)
