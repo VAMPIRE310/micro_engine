@@ -1,0 +1,56 @@
+# ============================================================
+# Dockerfile.rust — Bybit Market-Data Ingester (Rust)
+# Multi-stage build: compile → minimal runtime image
+# ============================================================
+
+# ── Stage 1: build ──────────────────────────────────────────
+FROM rust:1.78-slim AS builder
+
+WORKDIR /build
+
+# System deps needed by reqwest (native-TLS via rustls, still needs CA certs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Cargo manifest + lock file first so dependency layer is cached
+# independently of source changes.
+COPY bybit_ingester/Cargo.toml ./Cargo.toml
+
+# Dummy main.rs so `cargo build --release` fetches & compiles all deps.
+# The real source replaces it in the next COPY step.
+RUN mkdir src && echo 'fn main(){}' > src/main.rs \
+    && cargo build --release \
+    && rm -f target/release/deps/bybit_ingester*
+
+# Now copy the real source files
+COPY bybit_ingester/main.rs      src/main.rs
+COPY bybit_ingester/websocket.rs src/websocket.rs
+COPY bybit_ingester/orderbook.rs src/orderbook.rs
+COPY bybit_ingester/metrics.rs   src/metrics.rs
+
+# Final release build (only recompiles changed crates)
+RUN cargo build --release
+
+# ── Stage 2: runtime ────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+# CA certs needed for HTTPS (Bybit REST symbol fetch)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/bybit_ingester /app/bybit_ingester
+
+# Tunable via Railway/docker-compose environment variables:
+#   REDIS_URL          — Redis connection string (default: local)
+#   MAX_SYMBOLS        — 0 = stream all linear perpetuals
+#   SYMBOL_OFFSET      — skip first N symbols (sharding across instances)
+#   MESSAGE_BUFFER_SIZE — internal channel depth
+
+EXPOSE 8080
+
+CMD ["/app/bybit_ingester"]

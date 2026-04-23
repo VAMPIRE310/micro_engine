@@ -1,0 +1,66 @@
+# ============================================================
+# micro_engine — Python dependencies
+# Railway / Docker deployment
+# ============================================================
+
+# -----------------------------------------------------------
+# PyTorch  (CPU-only build — saves ~1 GB on Railway/Docker)
+# For GPU builds remove the --extra-index-url line and use
+# the default torch wheel from PyPI.
+# -----------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+
+# -----------------------------------------------------------
+# Data / ML
+# -----------------------------------------------------------
+numpy>=1.26,<2.0
+# numba — JIT-compiles the indicator kernels in feature_engine_v2.py
+numba>=0.59,<1.0
+pandas>=2.2,<3.0
+polars>=0.20,<1.0
+pyarrow>=15.0,<17.0
+
+# -----------------------------------------------------------
+# HTTP & REST
+# -----------------------------------------------------------
+requests>=2.31,<3.0
+urllib3>=2.0,<3.0
+# aiohttp — async HTTP client used for REST polling fallback (tier-4 market data)
+aiohttp>=3.13.3,<4.0
+
+# -----------------------------------------------------------
+# WebSocket (two libs — sync + async, both used in rsa_auth)
+# -----------------------------------------------------------
+# websocket.WebSocketApp — synchronous client used in rsa_auth.py
+websocket-client>=1.7,<2.0
+# websockets.connect — async client used in BybitV5Websocket + main engine
+websockets>=12.0,<13.0
+
+# -----------------------------------------------------------
+# Cryptography / RSA auth
+# -----------------------------------------------------------
+# pycryptodome — Crypto.Hash / Crypto.PublicKey / Crypto.Signature (RSA auth)
+pycryptodome>=3.20,<4.0
+# cryptography — cryptography.hazmat (also imported in rsa_auth.py)
+cryptography>=42.0,<45.0
+
+# -----------------------------------------------------------
+# NTP time-sync (optional import in rsa_auth — keep present)
+# -----------------------------------------------------------
+ntplib>=0.4,<1.0
+
+# -----------------------------------------------------------
+# Redis (Rust ingester publishes; Python may consume)
+# -----------------------------------------------------------
+redis>=5.0,<6.0
+
+# -----------------------------------------------------------
+# Webhook server (optional — used by WebhookOrderRouter in rsa_auth)
+# -----------------------------------------------------------
+flask>=2.3.2,<4.0
+
+# -----------------------------------------------------------
+# Environment variables helper
+# -----------------------------------------------------------
+python-dotenv>=1.0,<2.0

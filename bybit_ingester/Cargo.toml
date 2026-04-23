@@ -1,0 +1,46 @@
+[package]
+name    = "bybit_ingester"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bybit_ingester"
+path = "src/main.rs"
+
+[dependencies]
+# Error handling
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (symbol fetch from Bybit REST)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# WebSocket (Bybit public stream)
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Axum fast-lane WebSocket server (Python clients connect here)
+axum = { version = "0.7", features = ["ws"] }
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrent data structures
+dashmap    = "5"
+parking_lot = "0.12"
+
+# Multi-producer single-consumer channels (shards → processor)
+flume = "0.11"
+
+# Redis pub/sub (market data fan-out)
+redis = { version = "0.25", features = ["tokio-comp", "aio"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
