@@ -84,7 +84,18 @@ class MicroAgent:
         """Load locally-trained lifecycle_lstm.pt weights."""
         if os.path.exists(path):
             state = torch.load(path, map_location=self.device, weights_only=True)
-            self.model.load_state_dict(state, strict=False)
+            model_state = self.model.state_dict()
+            compatible = {
+                k: v for k, v in state.items()
+                if k in model_state and v.shape == model_state[k].shape
+            }
+            skipped = [k for k in state if k not in compatible]
+            if skipped:
+                log.warning(
+                    "Skipped %d checkpoint key(s) with incompatible shapes: %s",
+                    len(skipped), skipped,
+                )
+            self.model.load_state_dict(compatible, strict=False)
             log.info("Master LSTM weights loaded from %s", path)
         else:
             log.warning("No weights at %s — running with random init.", path)
