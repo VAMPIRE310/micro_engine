@@ -72,6 +72,7 @@ from core.agents.micro_agent import MicroAgent
 from core.feature_engine_v2 import FeatureEngineV2
 from core.hybrid_volume_trailing import HybridVolumeTrailingStop, HybridStopConfig, TrailingDirection
 from core.token_profiler import TokenProfiler
+from core.pg_backend import PgBackend
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -87,7 +88,12 @@ log = logging.getLogger("MicroEngine")
 # ---------------------------------------------------------------------------
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
 RUST_WS_URL = os.environ.get("RUST_WS_URL", "ws://localhost:8080")
+# Railway: set via Reference Variable → ${{redis-tbj0.REDIS_URL}}
+# This links the Redis service in Railway's canvas (fixes the "split in 2" view).
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+# Railway: set via Reference Variable → ${{Postgres.DATABASE_URL}}
+# Enables persistent experience replay and model checkpoints across deploys.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 HEDGE_TRIGGER_LOSS = float(os.environ.get("HEDGE_TRIGGER_LOSS_USDT", "-15.0"))
 PROFIT_BUFFER = float(os.environ.get("PROFIT_BUFFER_USDT", "0.5"))
 FEE_RATE = 0.0006   # Bybit taker fee 0.06 % — conservative
@@ -875,7 +881,12 @@ class MicroExecutionEngine:
         self._api_config = api_config
 
         # AI agent — device auto-detects CUDA when available, else CPU
-        self.agent = MicroAgent(device="auto")
+        _pg = PgBackend(DATABASE_URL)
+        if _pg.available:
+            log.info("PostgreSQL backend enabled — experience + model checkpoints persistent.")
+        else:
+            log.warning("DATABASE_URL not set — experience replay and model weights are ephemeral.")
+        self.agent = MicroAgent(device="auto", pg_backend=_pg)
         self.agent.load_weights(WEIGHTS_PATH)
 
         # Market data stream (Rust primary / RSA private WS / public WS / REST fallback).
@@ -897,6 +908,10 @@ class MicroExecutionEngine:
         self._positions: Dict[int, dict] = {}
         self._session_realized: Dict[str, float] = defaultdict(float)
         self._agent_active = False
+
+        # Per-position tick counter for sampled HOLD experience logging.
+        # Only 1-in-20 HOLD ticks are recorded to avoid flooding the replay buffer.
+        self._hold_tick_counters: Dict[int, int] = defaultdict(int)
 
         # ── Feature engine ───────────────────────────────────────────────────
         self._feature_engine = FeatureEngineV2(redis_client=None)
@@ -970,6 +985,7 @@ class MicroExecutionEngine:
                     realised = float(closed.get("cumRealisedPnl", 0) or 0)
                     self._session_realized[self.symbol] += realised
                     self._trailing_stops.pop(idx, None)
+                    self._hold_tick_counters.pop(idx, None)
                     log.info(
                         "[PositionClosed] idx=%d realised=%.4f session_total=%.4f",
                         idx,
@@ -1387,8 +1403,19 @@ class MicroExecutionEngine:
             log.info("[WAVE-HEDGE] AI signals HEDGE. PnL=%.4f", pnl)
             hedge_side = "Sell" if side == "Buy" else "Buy"
             hedge_idx  = 1 if hedge_side == "Buy" else 2
-            await self._execute_order(hedge_side, size, position_idx=hedge_idx)
+            ok = await self._execute_order(hedge_side, size, position_idx=hedge_idx)
+            if ok:
+                # Reward: cost of opening the hedge (negative signal proportional
+                # to how far the position moved against us before hedging).
+                self.agent.self_reflect(state_tensor, "HEDGE", pnl - fees)
         else:
+            # HOLD or WAVE_ADD — sample 1-in-20 ticks to avoid flooding the
+            # replay buffer while still giving the model a continuous signal.
+            self._hold_tick_counters[idx] += 1
+            if self._hold_tick_counters[idx] % 20 == 0:
+                # Reward: fraction of current net_pnl — positive reinforcement
+                # for holding a position that is still profitable.
+                self.agent.self_reflect(state_tensor, "HOLD", net_pnl * 0.05)
             log.debug("[HOLD] AI=%s  PnL=%.4f  session=%.4f", action, pnl, session_pnl)
 
     async def _management_loop(self) -> None:
