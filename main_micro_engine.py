@@ -742,10 +742,19 @@ class MicroExecutionEngine:
         self, side: str, qty: float, reduce_only: bool = False, position_idx: int = 0
     ) -> bool:
         """
-        Place a market order.
-        Primary path: Bybit WS trade channel (RSA-signed, no REST).
-        Fallback:     REST via BybitV5Client if WS trade is not yet connected.
+        Place a market order in hedge-mode (positionIdx 1=Long, 2=Short).
+
+        position_idx conventions
+        ------------------------
+        1  — Long position  (Buy to open, Sell+reduce_only to close)
+        2  — Short position (Sell to open, Buy+reduce_only to close)
+
+        All close/reduce orders MUST pass reduce_only=True — callers are
+        responsible for this; it is asserted here as a safety net.
         """
+        assert not (reduce_only is False and position_idx == 0), (
+            "_execute_order: position_idx must be 1 or 2 in hedge mode"
+        )
         qty_str = str(qty)
         # ── Primary: WS trade ────────────────────────────────────────────────
         ws_res = await self.trade_ws.place_order(
@@ -877,7 +886,9 @@ class MicroExecutionEngine:
                     pnl, HEDGE_TRIGGER_LOSS,
                 )
                 hedge_side = "Sell" if side == "Buy" else "Buy"
-                await self._execute_order(hedge_side, size)
+                # Buy hedge → Long slot (idx 1); Sell hedge → Short slot (idx 2)
+                hedge_idx  = 1 if hedge_side == "Buy" else 2
+                await self._execute_order(hedge_side, size, position_idx=hedge_idx)
             else:
                 log.debug("[LOCKED] PnL=%.4f — close blocked (in loss).", pnl)
             return
@@ -920,7 +931,8 @@ class MicroExecutionEngine:
         elif action == "HEDGE":
             log.info("[WAVE-HEDGE] AI signals HEDGE. PnL=%.4f", pnl)
             hedge_side = "Sell" if side == "Buy" else "Buy"
-            await self._execute_order(hedge_side, size)
+            hedge_idx  = 1 if hedge_side == "Buy" else 2
+            await self._execute_order(hedge_side, size, position_idx=hedge_idx)
         else:
             log.debug("[HOLD] AI=%s  PnL=%.4f  session=%.4f", action, pnl, session_pnl)
 
