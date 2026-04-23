@@ -701,7 +701,10 @@ class TradeStream:
 
                     raw  = await asyncio.wait_for(ws.recv(), timeout=10)
                     resp = json.loads(raw)
-                    if not resp.get("success"):
+                    # Trade WS returns {"retCode": 0, "retMsg": "OK", ...};
+                    # Private WS returns {"success": true, ...}.  Accept either.
+                    auth_ok = resp.get("success") is True or resp.get("retCode") == 0
+                    if not auth_ok:
                         log.error("[TradeWS] Auth failed: %s", resp)
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
