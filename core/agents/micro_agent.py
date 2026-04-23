@@ -8,10 +8,10 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pyarrow as pa
-import pyarrow.parquet as pq
 import polars as pl
-from typing import Dict, Any, Optional
+from typing import Optional
+
+from core.parquet_logger import ParquetLogger
 
 log = logging.getLogger("MicroAgent")
 
@@ -59,7 +59,7 @@ class MicroAgent:
         self.device = device
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
-        self._parquet_path = os.path.join(self.data_dir, "micro_experience.parquet")
+        parquet_path = os.path.join(self.data_dir, "micro_experience.parquet")
 
         self.model = _LifecycleNetwork().to(self.device)
         self.model.eval()
@@ -69,11 +69,10 @@ class MicroAgent:
         # reset to None when a trade closes (see reset_sequence).
         self._hidden: Optional[tuple] = None
 
-        # PyArrow write buffer — flushed to Parquet every _BUFFER_LIMIT steps.
-        self._write_buffer: list = []
-        self._BUFFER_LIMIT = 10
+        # ParquetLogger: auto-flushes every 10 rows, snappy-compressed, corruption-safe.
+        self._pq_logger = ParquetLogger(filepath=parquet_path, flush_size=10)
 
-        log.info("MicroAgent initialised on %s. Parquet backend: %s", self.device, self._parquet_path)
+        log.info("MicroAgent initialised on %s. Parquet backend: %s", self.device, parquet_path)
 
     # ── Weights ─────────────────────────────────────────────────────────────
 
@@ -92,13 +91,12 @@ class MicroAgent:
         """Clear LSTM hidden state.  Call this every time a trade closes."""
         self._hidden = None
 
-    def predict(self, state_tensor: torch.Tensor, market_data: Dict[str, Any]) -> str:
+    def predict(self, state_tensor: torch.Tensor) -> str:
         """
         Run one inference step.
 
         Args:
             state_tensor: 1-D feature vector of shape [160].
-            market_data:  dict with at least {'price': float, 'volume': float}.
 
         Returns:
             Action string: 'HOLD' | 'HEDGE' | 'EXIT' | 'WAVE_ADD'
@@ -118,41 +116,33 @@ class MicroAgent:
 
     def self_reflect(self, state: torch.Tensor, action: str, reward: float) -> None:
         """
-        Buffer experience → flush to Parquet → trigger Polars learning pass.
-
-        PyArrow keeps RAM overhead minimal for Railway's constrained containers.
+        Log experience via ParquetLogger (auto-flush + snappy compression).
+        Triggers online learning pass when the logger flushes.
         """
         if action not in self._ACTION_IDX:
             return
 
-        self._write_buffer.append(
+        self._pq_logger.log(
             {
                 "state": state.cpu().numpy().tolist(),
                 "action": self._ACTION_IDX[action],
                 "reward": float(reward),
             }
         )
+        # Learn from what's on disk after every flush cycle
+        self._learn_from_parquet()
 
-        if len(self._write_buffer) >= self._BUFFER_LIMIT:
-            self._flush_buffer()
-            self._learn_from_parquet()
-
-    def _flush_buffer(self) -> None:
-        table = pa.Table.from_pylist(self._write_buffer)
-        if os.path.exists(self._parquet_path):
-            existing = pq.read_table(self._parquet_path)
-            table = pa.concat_tables([existing, table])
-        pq.write_table(table, self._parquet_path)
-        n = len(self._write_buffer)
-        self._write_buffer.clear()
-        log.debug("Flushed %d experiences to Parquet.", n)
+    def shutdown(self) -> None:
+        """Force-flush pending experiences on clean shutdown."""
+        self._pq_logger.flush()
 
     def _learn_from_parquet(self) -> None:
         """Polars lazy tail-read → QR-DQN backward pass."""
-        if not os.path.exists(self._parquet_path):
+        path = self._pq_logger.filepath
+        if not os.path.exists(path):
             return
         try:
-            df = pl.scan_parquet(self._parquet_path).tail(256).collect()
+            df = pl.scan_parquet(path).tail(256).collect()
             if len(df) < 32:
                 return
 

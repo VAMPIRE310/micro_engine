@@ -48,13 +48,17 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 from security.rsa_auth import APIConfig, BybitV5Client
 from core.agents.micro_agent import MicroAgent
+from core.feature_engine_v2 import FeatureEngineV2
+from core.hybrid_volume_trailing import HybridVolumeTrailingStop, HybridStopConfig, TrailingDirection
+from core.token_profiler import TokenProfiler
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -380,6 +384,14 @@ class MicroExecutionEngine:
         # Agent active flag (set when ≥1 position detected)
         self._agent_active = False
 
+        # ── Feature engine (160-dim Numba JIT state tensor) ──────────────────
+        self._feature_engine = FeatureEngineV2(redis_client=None)
+        # Rolling close-price buffer per symbol (up to 200 bars)
+        self._price_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+
+        # ── Trailing stops per position idx ──────────────────────────────────
+        self._trailing_stops: Dict[int, HybridVolumeTrailingStop] = {}
+
         log.info("MicroExecutionEngine armed for %s.", symbol)
 
     # ── Private WS callbacks ─────────────────────────────────────────────────
@@ -407,12 +419,22 @@ class MicroExecutionEngine:
                         pos.get("size"),
                         float(pos.get("avgPrice", 0) or 0),
                     )
+                    # Arm a trailing stop anchored at entry price
+                    entry = float(pos.get("avgPrice", 0) or 0)
+                    if entry > 0:
+                        direction = (TrailingDirection.LONG if pos.get("side") == "Buy"
+                                     else TrailingDirection.SHORT)
+                        self._trailing_stops[idx] = HybridVolumeTrailingStop(
+                            symbol=self.symbol,
+                            config=HybridStopConfig(direction=direction, entry_price=entry),
+                        )
             else:
                 # size == 0 → position closed
                 if idx in self._positions:
                     closed = self._positions.pop(idx)
                     realised = float(closed.get("cumRealisedPnl", 0) or 0)
                     self._session_realized[self.symbol] += realised
+                    self._trailing_stops.pop(idx, None)
                     log.info(
                         "[PositionClosed] idx=%d realised=%.4f session_total=%.4f",
                         idx,
@@ -517,31 +539,42 @@ class MicroExecutionEngine:
 
     def _build_state_tensor(self, pos: dict, market_data: dict) -> torch.Tensor:
         """
-        Build a 160-dim feature vector from available position + market data.
+        Build the 160-dim feature tensor via FeatureEngineV2.
 
-        This is a minimal stand-in until the full feature engine is wired up.
-        The vector is deterministic (no random) so the LSTM hidden state evolves
-        consistently across ticks.  Swap this method's body for a real feature
-        call when ready.
+        Uses the rolling price buffer accumulated by the management loop.
+        Falls back to zeros if fewer than 20 bars are available (engine warm-up).
+        TokenProfiler injects chain/tier metadata into slots [24, 25].
         """
         price = float(market_data.get("price", 0) or 0)
-        volume = float(market_data.get("volume", 0) or 0)
-        entry = float(pos.get("avgPrice", 0) or 0)
-        size = float(pos.get("size", 0) or 0)
-        upnl = float(pos.get("unrealisedPnl", 0) or 0)
-        session = self._session_realized[self.symbol]
+        if price <= 0:
+            return torch.zeros(160)
 
-        # Normalised scalars packed into a 160-dim vector.
-        # First 6 dims = real data; rest = 0 until feature engine is integrated.
-        raw = [
-            price / max(entry, 1e-9) - 1.0,          # price-vs-entry ratio
-            upnl / max(size * entry, 1e-9),            # pnl as fraction of notional
-            session / max(size * entry, 1e-9),         # session pnl fraction
-            volume / 1e6,                              # rough volume normalisation
-            float(size),
-            1.0 if pos.get("side") == "Buy" else -1.0,
-        ] + [0.0] * 154
+        buf = self._price_buffers[self.symbol]
+        if len(buf) < 20:
+            return torch.zeros(160)
 
+        closes = np.array(list(buf), dtype=np.float32)
+        ohlcv = {
+            "close":  closes,
+            "open":   closes,
+            "high":   closes,
+            "low":    closes,
+            "volume": np.ones_like(closes),   # volume ≈1 until kline buffer is wired
+        }
+
+        position_ctx = {
+            "size":            float(pos.get("size", 0) or 0),
+            "entry_price":     float(pos.get("avgPrice", 0) or 0),
+            "pnl":             float(pos.get("unrealisedPnl", 0) or 0),
+            "leverage":        float(pos.get("leverage", 1) or 1),
+            "margin_used":     float(pos.get("positionBalance", 0) or 0),
+            "account_equity":  1.0,   # equity unknown without REST call
+            "side":            str(pos.get("side", "none")),
+            "duration_seconds": 0.0,
+        }
+
+        raw = self._feature_engine.create_state_vector(ohlcv, position=position_ctx)
+        raw = TokenProfiler.inject_profile(self.symbol, raw)
         return torch.tensor(raw, dtype=torch.float32)
 
     def _manage_single(self, pos: dict) -> None:
@@ -552,6 +585,7 @@ class MicroExecutionEngine:
         idx = int(pos.get("positionIdx", 0))
         fees = self._estimate_fees(pos)
         session_pnl = self._session_realized[self.symbol]
+        tick = self.market.last_tick
 
         # ── Physical blocker: cannot close in loss ────────────────────────
         if pnl < 0:
@@ -567,6 +601,22 @@ class MicroExecutionEngine:
                 log.debug("[LOCKED] PnL=%.4f — close blocked (in loss).", pnl)
             return
 
+        # ── Trailing stop (only active when position is in profit) ────────
+        if tick["price"] > 0 and idx in self._trailing_stops:
+            ts = self._trailing_stops[idx]
+            triggered = ts.ingest_tick(tick["price"], tick["volume"])
+            if triggered and pnl > 0:
+                log.info(
+                    "[TRAIL] Trailing stop fired (%s). PnL=%.4f — locking in profit.",
+                    ts.trigger_reason, pnl,
+                )
+                close_side = "Sell" if side == "Buy" else "Buy"
+                state_tensor = self._build_state_tensor(pos, tick)
+                ok = self._execute_order(close_side, size, reduce_only=True, position_idx=idx)
+                if ok:
+                    self.agent.self_reflect(state_tensor, "EXIT", pnl + session_pnl - fees * 2)
+                return
+
         # ── Profitable: ask AI whether to close ──────────────────────────
         # Only allow close if current PnL + session memory covers fees
         net_pnl = pnl + session_pnl - fees * 2
@@ -574,20 +624,13 @@ class MicroExecutionEngine:
             log.debug("[WAIT] net_pnl=%.4f below buffer=%.4f.", net_pnl, PROFIT_BUFFER)
             return
 
-        tick = self.market.last_tick
-        market_data = {"price": tick["price"], "volume": tick["volume"]}
-
-        # Guard: if we have no live price yet, do not let the agent act —
-        # running on a zero-price tick would produce meaningless decisions.
-        if market_data["price"] <= 0:
+        # Guard: if we have no live price yet, do not let the agent act.
+        if tick["price"] <= 0:
             log.debug("[WAIT] No live price available yet — skipping AI decision.")
             return
 
-        # Build a minimal deterministic feature vector from what we DO have.
-        # Replace this block with a proper feature-engine call once integrated.
-        state_tensor = self._build_state_tensor(pos, market_data)
-
-        action = self.agent.predict(state_tensor, market_data)
+        state_tensor = self._build_state_tensor(pos, tick)
+        action = self.agent.predict(state_tensor)
 
         if action == "EXIT":
             log.info("[PROFIT] AI signals EXIT. PnL=%.4f net=%.4f", pnl, net_pnl)
@@ -615,6 +658,12 @@ class MicroExecutionEngine:
 
         while True:
             try:
+                # Keep rolling price buffer up-to-date regardless of position state
+                # so the feature engine has history by the time a trade is detected.
+                price = self.market.last_tick["price"]
+                if price > 0:
+                    self._price_buffers[self.symbol].append(price)
+
                 if self._agent_active:
                     n = len(self._positions)
                     if n >= 2:
