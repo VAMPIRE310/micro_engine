@@ -64,6 +64,7 @@ from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
 import numpy as np
+import redis
 import torch
 
 from security.rsa_auth import APIConfig, BybitV5Client
@@ -86,6 +87,7 @@ log = logging.getLogger("MicroEngine")
 # ---------------------------------------------------------------------------
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
 RUST_WS_URL = os.environ.get("RUST_WS_URL", "ws://localhost:8080")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 HEDGE_TRIGGER_LOSS = float(os.environ.get("HEDGE_TRIGGER_LOSS_USDT", "-15.0"))
 PROFIT_BUFFER = float(os.environ.get("PROFIT_BUFFER_USDT", "0.5"))
 FEE_RATE = 0.0006   # Bybit taker fee 0.06 % — conservative
@@ -646,6 +648,17 @@ class MicroExecutionEngine:
         self._feature_engine = FeatureEngineV2(redis_client=None)
         self._price_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
 
+        # ── Redis client (reads MTF kline history + live trade lists) ─────────
+        try:
+            self._redis = redis.Redis.from_url(REDIS_URL, decode_responses=True,
+                                               socket_connect_timeout=2)
+            self._redis.ping()
+            self._feature_engine._redis = self._redis
+            log.info("Redis connected: %s", REDIS_URL)
+        except Exception as exc:
+            log.warning("Redis unavailable (%s) — MTF features will be zeros.", exc)
+            self._redis = None
+
         # ── Trailing stops per position idx ──────────────────────────────────
         self._trailing_stops: Dict[int, HybridVolumeTrailingStop] = {}
 
@@ -861,28 +874,169 @@ class MicroExecutionEngine:
         else:
             log.debug("[HEDGED] Combined PnL=%.4f — waiting.", combined)
 
+    def _fetch_mtf_data(self, symbol: str) -> Dict[str, np.ndarray]:
+        """
+        Pull real OHLCV arrays from the Redis rolling lists written by the
+        Rust→Exodia bridge (market:kline_history:{symbol}:{tf}).
+
+        Returns a dict keyed by timeframe string ("1", "5", "15", "60", "240", "D").
+        Each value is a dict with keys "open", "high", "low", "close", "volume"
+        as float64 numpy arrays, or an empty dict if Redis is unavailable or the
+        list has fewer than 20 bars.
+        """
+        timeframes = ["1", "5", "15", "60", "240", "D"]
+        result: Dict[str, dict] = {}
+
+        if self._redis is None:
+            return {tf: {} for tf in timeframes}
+
+        for tf in timeframes:
+            key = f"market:kline_history:{symbol}:{tf}"
+            try:
+                raw_list = self._redis.lrange(key, -200, -1)
+            except Exception:
+                result[tf] = {}
+                continue
+
+            if not raw_list or len(raw_list) < 20:
+                result[tf] = {}
+                continue
+
+            bars = []
+            for item in raw_list:
+                try:
+                    bars.append(json.loads(item))
+                except Exception:
+                    pass
+
+            if len(bars) < 20:
+                result[tf] = {}
+                continue
+
+            result[tf] = {
+                "open":   np.array([float(b.get("open",   0)) for b in bars], dtype=np.float64),
+                "high":   np.array([float(b.get("high",   0)) for b in bars], dtype=np.float64),
+                "low":    np.array([float(b.get("low",    0)) for b in bars], dtype=np.float64),
+                "close":  np.array([float(b.get("close",  0)) for b in bars], dtype=np.float64),
+                "volume": np.array([float(b.get("volume", 0)) for b in bars], dtype=np.float64),
+            }
+
+        return result
+
+    def _process_literal_livestream(self, symbol: str):
+        """
+        Aggregate the last 200 raw publicTrade ticks from the Redis rolling list
+        written by the bridge (market:live_trades:{symbol}).
+
+        Returns a tuple (buy_volumes, sell_volumes) as float32 numpy arrays
+        suitable for VPIN / CVD computation inside FeatureEngineV2, or (None, None)
+        when no data is available.
+
+        Also returns a micro-structure summary array (10 dims):
+          [0] CVD (buy_vol - sell_vol, normalised by total)
+          [1] imbalance (CVD / total_vol)
+          [2] buy_vol  (raw)
+          [3] sell_vol (raw)
+          [4] tick price std-dev
+          [5] last tick price
+          [6] tick count (normalised /200)
+          [7-9] reserved (zeros)
+        """
+        _zero_vols = (np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32))
+
+        if self._redis is None:
+            return _zero_vols, np.zeros(10, dtype=np.float32)
+
+        try:
+            raw_ticks = self._redis.lrange(f"market:live_trades:{symbol}", -200, -1)
+        except Exception:
+            return _zero_vols, np.zeros(10, dtype=np.float32)
+
+        if not raw_ticks:
+            return _zero_vols, np.zeros(10, dtype=np.float32)
+
+        buy_vols: List[float] = []
+        sell_vols: List[float] = []
+        tick_prices: List[float] = []
+
+        for raw in raw_ticks:
+            try:
+                tick = json.loads(raw)
+                price = float(tick.get("price", tick.get("p", 0)) or 0)
+                size  = float(tick.get("size",  tick.get("v", 0)) or 0)
+                side  = str(tick.get("side",    tick.get("S", "Buy")))
+                if price <= 0 or size < 0:
+                    continue
+                tick_prices.append(price)
+                if side in ("Buy", "buy"):
+                    buy_vols.append(size)
+                    sell_vols.append(0.0)
+                else:
+                    buy_vols.append(0.0)
+                    sell_vols.append(size)
+            except Exception:
+                pass
+
+        if not buy_vols:
+            return _zero_vols, np.zeros(10, dtype=np.float32)
+
+        bv = np.array(buy_vols,  dtype=np.float32)
+        sv = np.array(sell_vols, dtype=np.float32)
+
+        total_buy  = float(bv.sum())
+        total_sell = float(sv.sum())
+        total_vol  = total_buy + total_sell
+        cvd        = total_buy - total_sell
+        imbalance  = cvd / total_vol if total_vol > 0 else 0.0
+
+        micro = np.array([
+            imbalance,
+            cvd / (total_vol + 1e-8),
+            total_buy,
+            total_sell,
+            float(np.std(tick_prices)) if len(tick_prices) > 1 else 0.0,
+            float(tick_prices[-1])     if tick_prices else 0.0,
+            len(tick_prices) / 200.0,
+            0.0, 0.0, 0.0,
+        ], dtype=np.float32)
+
+        return (bv, sv), micro
+
     def _build_state_tensor(self, pos: dict, market_data: dict) -> torch.Tensor:
         """
-        Build the 160-dim feature tensor via FeatureEngineV2.
-        Falls back to zeros during warm-up (< 20 price bars).
+        Build the 160-dim feature tensor using real MTF OHLCV data from Redis
+        and the live publicTrade firehose.
+
+        Falls back to zeros when Redis is unavailable or insufficient history
+        has accumulated (< 20 bars on the 1m timeframe).
         """
         price = float(market_data.get("price", 0) or 0)
         if price <= 0:
             return torch.zeros(160)
 
-        buf = self._price_buffers[self.symbol]
-        if len(buf) < 20:
-            return torch.zeros(160)
+        # ── 1. Pull real multi-timeframe OHLCV from Redis ─────────────────────
+        mtf = self._fetch_mtf_data(self.symbol)
+        ohlcv_1m = mtf.get("1", {})
 
-        closes = np.array(list(buf), dtype=np.float32)
-        ohlcv = {
-            "close":  closes,
-            "open":   closes,
-            "high":   closes,
-            "low":    closes,
-            "volume": np.ones_like(closes),
-        }
+        # Need at least 20 bars on the base timeframe for indicators to fire
+        if not ohlcv_1m or len(ohlcv_1m.get("close", [])) < 20:
+            # Fall back to price buffer only (no structural data yet)
+            buf = self._price_buffers[self.symbol]
+            if len(buf) < 20:
+                return torch.zeros(160)
+            closes = np.array(list(buf), dtype=np.float32)
+            ohlcv_1m = {
+                "close":  closes,
+                "open":   closes,
+                "high":   closes,
+                "low":    closes,
+                "volume": np.ones_like(closes),
+            }
 
+        # ── 2. Pull live trade micro-structure ────────────────────────────────
+        (buy_vols, sell_vols), _micro = self._process_literal_livestream(self.symbol)
+
+        # ── 3. Build position context ─────────────────────────────────────────
         equity = getattr(self, "_usdt_equity", 1.0)
         position_ctx = {
             "size":             float(pos.get("size", 0) or 0),
@@ -895,7 +1049,13 @@ class MicroExecutionEngine:
             "duration_seconds": 0.0,
         }
 
-        raw = self._feature_engine.create_state_vector(ohlcv, position=position_ctx)
+        # ── 4. Compute the 160-dim tensor via FeatureEngineV2 ─────────────────
+        raw = self._feature_engine.create_state_vector(
+            ohlcv_1m,
+            position=position_ctx,
+            buy_volumes=buy_vols,
+            sell_volumes=sell_vols,
+        )
         raw = TokenProfiler.inject_profile(self.symbol, raw)
         return torch.tensor(raw, dtype=torch.float32)
 

@@ -70,6 +70,8 @@ services:
     command: ["python", "-m", "core.rust_redis_bridge"]
     environment:
       REDIS_URL: "redis://redis:6379"
+      BRIDGE_MAX_KLINE_HISTORY: "${BRIDGE_MAX_KLINE_HISTORY:-500}"
+      BRIDGE_MAX_TRADE_HISTORY: "${BRIDGE_MAX_TRADE_HISTORY:-1000}"
 
   # ── Python Micro-Execution Engine ───────────────────────
   micro-engine:

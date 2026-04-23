@@ -8,7 +8,7 @@ Exodia Feature Engine reads via LRANGE.
 Channel → List mapping
 ----------------------
   klines:{SYMBOL}:{TF}   →  market:kline_history:{SYMBOL}:{TF}
-  trades:{SYMBOL}        →  market:trade_history:{SYMBOL}
+  trades:{SYMBOL}        →  market:live_trades:{SYMBOL}
 
 Timeframe values published by Rust: "1", "5", "15", "60", "120", "240", "D"
 These match the suffixes already expected by the feature engine, so no remapping
@@ -35,8 +35,9 @@ logging.basicConfig(
 log = logging.getLogger("rust_redis_bridge")
 
 # How many bars / trades to keep per list key (prevents unbounded memory growth).
-MAX_KLINE_HISTORY: int = 500
-MAX_TRADE_HISTORY: int = 1000
+# Override via environment variables if your deployment has different memory constraints.
+MAX_KLINE_HISTORY: int = int(os.environ.get("BRIDGE_MAX_KLINE_HISTORY", "500"))
+MAX_TRADE_HISTORY: int = int(os.environ.get("BRIDGE_MAX_TRADE_HISTORY", "1000"))
 
 
 class RustRedisBridge:
@@ -92,7 +93,7 @@ class RustRedisBridge:
             elif stream_type == "trades":
                 # Channel format: trades:{SYMBOL}
                 symbol = parts[1]
-                list_key = f"market:trade_history:{symbol}"
+                list_key = f"market:live_trades:{symbol}"
                 max_len = MAX_TRADE_HISTORY
 
             else:

@@ -1202,9 +1202,11 @@ if __name__ == "__main__":
                         continue
                     try:
                         d = json.loads(raw)
-                        # Trigger on both live trade ticks (publicTrade.* stream)
-                        # and ticker snapshots — trades arrive at every executed
-                        # fill so they are the true high-resolution price signal.
+                        # Trigger tensor computation on:
+                        #  - "trade"  messages from the publicTrade.* livestream
+                        #              (every individual exchange fill — true micro-structure)
+                        #  - "tick"   messages from the tickers.* snapshot stream
+                        #              (best bid/ask + 24 h stats; lower frequency)
                         if d.get("type") in ("tick", "trade"):
                             sym = d.get("symbol", "")
                             if sym:
