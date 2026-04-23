@@ -227,7 +227,15 @@ class MarketDataStream:
         return True
 
     async def _run_bybit_public(self) -> None:
-        """Subscribe to tickers.{symbol} on Bybit public WS (fallback)."""
+        """
+        Fallback: subscribe to publicTrade.{symbol} on Bybit public WS.
+
+        Uses publicTrade (not tickers) because it delivers real per-trade price
+        and size — exactly what the HybridVolumeTrailingStop needs for its
+        micro-VWAP and volume-surge detector.  All messages are routed through
+        _ingest() so the 100 ms throttle and tick_event both apply identically
+        to the Rust-engine path.
+        """
         try:
             import websockets
             async with websockets.connect(
@@ -235,21 +243,24 @@ class MarketDataStream:
                 ping_interval=15,
                 ping_timeout=10,
             ) as ws:
-                sub = {"op": "subscribe", "args": [f"tickers.{self.symbol}"]}
+                sub = {"op": "subscribe", "args": [f"publicTrade.{self.symbol}"]}
                 await ws.send(json.dumps(sub))
-                log.info("[MarketData] Subscribed to Bybit public WS: tickers.%s", self.symbol)
+                log.info("[MarketData] Subscribed to Bybit publicTrade.%s", self.symbol)
 
                 ping_task = asyncio.create_task(self._heartbeat(ws))
                 try:
                     async for raw in ws:
                         try:
                             msg = json.loads(raw)
-                            if msg.get("topic", "").startswith("tickers."):
-                                d = msg.get("data", {})
-                                price = float(d.get("lastPrice", 0) or 0)
-                                vol = float(d.get("volume24h", 0) or 0)
-                                if price > 0:
-                                    self.last_tick = {"price": price, "volume": vol}
+                            if msg.get("topic", "").startswith("publicTrade."):
+                                for trade in msg.get("data", []):
+                                    # Normalise to Rust-engine format so _ingest()
+                                    # handles throttle and tick_event uniformly.
+                                    self._ingest({
+                                        "type":  "trade",
+                                        "price": trade.get("p", 0),
+                                        "size":  trade.get("v", 0),
+                                    })
                         except Exception:
                             pass
                 finally:
