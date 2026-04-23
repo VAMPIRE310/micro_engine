@@ -1,15 +1,19 @@
 # ============================================================
-# railway.toml — Bybit Ingester (Rust)
+# railway.toml — Bybit Ingester (Rust, launched via Python)
 #
 # In the Railway dashboard, set this service's "Config File Path"
 # to:  bybit_ingester/railway.toml
+#
+# This service reuses the standard Python image (Dockerfile).
+# run_ingester.py installs cargo if needed, builds the Rust
+# binary, then exec()s it — so the running process is pure Rust.
 # ============================================================
 
 [build]
-builder      = "dockerfile"
-dockerfilePath = "Dockerfile.rust"
+builder        = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand         = "/app/bybit_ingester"
-restartPolicyType    = "on_failure"
+startCommand            = "python run_ingester.py"
+restartPolicyType       = "on_failure"
 restartPolicyMaxRetries = 10
