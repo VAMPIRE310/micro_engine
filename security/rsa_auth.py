@@ -953,9 +953,13 @@ class BybitV5Client:
     def _sync_time(self) -> float:
         """
         Synchronize time with Bybit server to prevent timestamp errors.
-        REPLACES your previous version entirely. Corrects logic leaks and dead blocks.
+
+        Priority:
+          1. NTP  — high precision, works when the container has outbound UDP 123.
+          2. Bybit REST /v5/market/time — simple HTTP GET, no auth required.
+          3. Safety fallback — keep existing offset (defaults to 0.0).
         """
-        # 1. Try NTP first (High Precision for local 4090 clock)
+        # 1. Try NTP first
         if NTP_AVAILABLE:
             try:
                 c = ntplib.NTPClient()
@@ -966,37 +970,34 @@ class BybitV5Client:
             except Exception as e:
                 logger.warning(f"[TIME] NTP sync failed: {e}")
 
-        # 2. Regional Failover (Bybit REST Endpoints)
-        # This loop replaces the repetitive 'try/except' blocks from your version
-        for region in self.config.region_priority:
+        # 2. Bybit REST time endpoint — mirrors how BybitV5Client.request() works
+        endpoints = self.ENDPOINT_PRIORITY if not self.config.demo else [self.BASE_URL_DEMO]
+        for base_url in endpoints:
             try:
                 start = time.time()
-                resp = self._session.get(
-                    f"{region.rest_url}/v5/market/time",
-                    timeout=3
+                resp = requests.get(
+                    f"{base_url}/v5/market/time",
+                    timeout=3,
                 )
                 end = time.time()
-                latency = (end - start) * 1000
-            
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get('retCode') == 0:
-                        # Precise Midpoint Calculation: (Request start + Response end) / 2
                         server_time = float(data['result']['timeSecond'])
                         local_time = (start + end) / 2
                         self.time_offset = server_time - local_time
-                    
-                        # Record Health Metrics
-                        self._health[region].record_latency(latency)
-                        logger.info(f"[TIME] Synced with {region.display_name}, offset={self.time_offset:.3f}s, latency={latency:.1f}ms")
+                        logger.info(
+                            f"[TIME] Synced via {base_url}, "
+                            f"offset={self.time_offset:.3f}s, "
+                            f"latency={(end - start) * 1000:.1f}ms"
+                        )
                         return self.time_offset
             except Exception as e:
-                logger.debug(f"[TIME] {region.display_name} sync failed: {e}")
+                logger.debug(f"[TIME] {base_url} sync failed: {e}")
                 continue
 
-        # 3. Safety Fallback
-        logger.error("[TIME] All time sync methods failed. Using 0.0 offset.")
-        self.time_offset = 0.0
+        # 3. Safety fallback
+        logger.warning("[TIME] All time sync methods failed. Keeping offset=%.3f.", self.time_offset)
         return self.time_offset
     
     def _get_timestamp(self) -> str:
