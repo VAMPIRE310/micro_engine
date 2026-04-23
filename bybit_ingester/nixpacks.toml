@@ -1,0 +1,15 @@
+# ============================================================
+# nixpacks.toml — Bybit Ingester (Rust)
+#
+# Used when the Railway service's Root Directory is set to
+# "bybit_ingester/" and builder = "nixpacks" (Railway's native
+# Railpack builder).  Railway auto-detects Cargo.toml and runs
+# cargo build --release; this file only adds the system
+# packages that reqwest (native-TLS) and ring (crypto) need.
+#
+# If you are using the Dockerfile path instead, this file is
+# ignored — keep it here as a zero-cost fallback.
+# ============================================================
+
+[phases.setup]
+nixPkgs = ["pkg-config", "openssl"]
