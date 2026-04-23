@@ -1202,7 +1202,10 @@ if __name__ == "__main__":
                         continue
                     try:
                         d = json.loads(raw)
-                        if d.get("type") == "tick":
+                        # Trigger on both live trade ticks (publicTrade.* stream)
+                        # and ticker snapshots — trades arrive at every executed
+                        # fill so they are the true high-resolution price signal.
+                        if d.get("type") in ("tick", "trade"):
                             sym = d.get("symbol", "")
                             if sym:
                                 _tick_q.put_nowait(sym)
