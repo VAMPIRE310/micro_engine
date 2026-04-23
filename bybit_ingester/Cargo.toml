@@ -5,7 +5,7 @@ edition = "2021"
 
 [[bin]]
 name = "bybit_ingester"
-path = "main.rs"
+path = "src/main.rs"
 
 [dependencies]
 # Error handling

@@ -425,7 +425,7 @@ class APIConfig:
     """
     api_key: str = None
     api_secret: Optional[str] = None           #The regular API secret
-    private_key_path: Optional[str] = r"C:\Users\VAMPIRE\OneDrive\Desktop\28v6ulhXpfSRlj59Wd_bybit_api.pem"     # The RSA Personal KEY .pem file 
+    private_key_path: Optional[str] = None  # path to .pem file — set via BYBIT_RSA_PRIVATE_KEY_PATH env var
     private_key_content: Optional[str] = None  # Alternative to path
     demo: bool = False                         # LIVE TRADING MODE - YOLO
     recv_window: int = 5000
