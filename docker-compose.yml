@@ -100,3 +100,18 @@ services:
       HEDGE_TRIGGER_LOSS_USDT: "${HEDGE_TRIGGER_LOSS_USDT:--15.0}"
       PROFIT_BUFFER_USDT: "${PROFIT_BUFFER_USDT:-0.5}"
       POLL_INTERVAL_SEC: "${POLL_INTERVAL_SEC:-3}"
+
+      # ── Railway / resource throttle ────────────────────
+      # Cap PyTorch intra-op threads to avoid starving Numba + asyncio at startup.
+      # On Railway Pro (32 vCPU) 4 threads gives full indicator throughput with
+      # headroom for all other processes. Set to 0 to let PyTorch auto-detect.
+      TORCH_NUM_THREADS: "${TORCH_NUM_THREADS:-4}"
+      # Numba JIT thread count — mirrors PyTorch limit for consistent behaviour.
+      NUMBA_NUM_THREADS: "${NUMBA_NUM_THREADS:-4}"
+      # Seconds the management loop sleeps between ticks when no tick event fires.
+      # Increase if Railway is showing high CPU usage between trades.
+      MANAGEMENT_LOOP_SLEEP_SEC: "${MANAGEMENT_LOOP_SLEEP_SEC:-0.5}"
+      # Grace period at startup (seconds) before the management loop and WS
+      # connections start competing with the Numba JIT compile. Increase on
+      # slow Railway start-up (e.g. cold-start with large model).
+      STARTUP_GRACE_SEC: "${STARTUP_GRACE_SEC:-15.0}"

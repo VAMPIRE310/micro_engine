@@ -18,6 +18,7 @@ Publishes completed tensor to Redis: ``market:state_tensor:{symbol}``
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -672,6 +673,10 @@ class FeatureEngineV2:
         """
         Force JIT compilation of every @njit helper so the first real call
         is not penalised by compilation latency.
+
+        This is CPU-bound and can take 5–30 s on a cold container.  Prefer
+        calling ``warmup_async()`` from an async context so the event loop
+        stays responsive during startup.
         """
         if self._warmed_up:
             return
@@ -700,6 +705,18 @@ class FeatureEngineV2:
 
         self._warmed_up = True
         logger.info("FeatureEngineV2 — JIT warmup complete (%.2fs)", time.time() - t0)
+
+    async def warmup_async(self, executor=None) -> None:
+        """
+        Run ``warmup()`` in a thread-pool executor so the asyncio event loop
+        stays free during the CPU-intensive Numba JIT compilation phase.
+
+        ``executor`` is passed directly to ``loop.run_in_executor``; pass
+        ``None`` to use the default executor (usually a ThreadPoolExecutor
+        whose size is ``min(32, cpu_count + 4)``).
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, self.warmup)
 
     # ------------------------------------------------------------------
     # Internal extraction methods

@@ -120,6 +120,34 @@ BYBIT_TRADE_WS_DEMO   = "wss://stream-demo.bybit.com/v5/trade"
 
 WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "lifecycle_lstm.pt")
 
+# ---------------------------------------------------------------------------
+# Railway / deployment resource knobs
+# ---------------------------------------------------------------------------
+# How many CPU threads PyTorch is allowed to use for intra-op parallelism.
+# On Railway Pro (32 vCPU) keeping this at 4 leaves plenty for Numba, Redis,
+# and async I/O without causing scheduler contention at startup.
+# Set to 0 to let PyTorch decide automatically.
+_TORCH_NUM_THREADS = int(os.environ.get("TORCH_NUM_THREADS", "4"))
+if _TORCH_NUM_THREADS > 0:
+    import torch as _torch_init
+    _torch_init.set_num_threads(_TORCH_NUM_THREADS)
+    _torch_init.set_num_interop_threads(max(1, _TORCH_NUM_THREADS // 2))
+
+# Numba thread count — cap to avoid starving other processes at JIT compile time.
+# Numba reads NUMBA_NUM_THREADS at import time; set it before numba is imported
+# (feature_engine_v2 imports numba, so this must be set before that module loads).
+if "NUMBA_NUM_THREADS" not in os.environ:
+    os.environ["NUMBA_NUM_THREADS"] = os.environ.get("NUMBA_NUM_THREADS", "4")
+
+# Seconds to sleep between management loop ticks.  Lower = more responsive,
+# higher = less CPU pressure.  Default 0.5 s is comfortable on Railway Pro.
+MANAGEMENT_LOOP_SLEEP = float(os.environ.get("MANAGEMENT_LOOP_SLEEP_SEC", "0.5"))
+
+# Grace period (seconds) after process start before the management loop begins
+# making trading decisions.  Lets WS connections stabilise and Numba JIT
+# finish without competing for CPU.
+STARTUP_GRACE_SEC = float(os.environ.get("STARTUP_GRACE_SEC", "15.0"))
+
 
 # ===========================================================================
 # RSA WebSocket auth helper
@@ -885,6 +913,12 @@ class MicroExecutionEngine:
         # ── Trailing stops per position idx ──────────────────────────────────
         self._trailing_stops: Dict[int, HybridVolumeTrailingStop] = {}
 
+        # ── Startup throttle ─────────────────────────────────────────────────
+        # Set when the Numba JIT warmup task completes.  _build_state_tensor
+        # returns torch.zeros(160) until this is set so the management loop
+        # can run safely during the warmup window without crashing.
+        self._warmup_done: asyncio.Event = asyncio.Event()
+
         log.info("MicroExecutionEngine armed for %s.", symbol)
 
     # ── Private WS callbacks ─────────────────────────────────────────────────
@@ -1230,9 +1264,13 @@ class MicroExecutionEngine:
         Build the 160-dim feature tensor using real MTF OHLCV data from Redis
         and the live publicTrade firehose.
 
-        Falls back to zeros when Redis is unavailable or insufficient history
+        Returns torch.zeros(160) while Numba JIT warmup is still in progress
+        (prevents the management loop from stalling the CPU-intensive compile).
+        Also returns zeros when Redis is unavailable or insufficient history
         has accumulated (< 20 bars on the 1m timeframe).
         """
+        if not self._warmup_done.is_set():
+            return torch.zeros(160)
         price = float(market_data.get("price", 0) or 0)
         if price <= 0:
             return torch.zeros(160)
@@ -1355,9 +1393,9 @@ class MicroExecutionEngine:
         Event-driven management loop.
 
         Waits on market.tick_event (set by the 100 ms throttled _ingest callback)
-        instead of sleeping a fixed interval.  Falls back to a 1 s timeout to
-        handle the rare case where a position update arrives while the market
-        stream is not yet connected.  No polling.
+        instead of sleeping a fixed interval.  Falls back to MANAGEMENT_LOOP_SLEEP
+        timeout to handle the rare case where a position update arrives while the
+        market stream is not yet connected.  No polling.
 
         Position state is populated entirely by the private WS callbacks
         (_on_position_update) and by _rest_sync_positions which fires on every
@@ -1366,7 +1404,10 @@ class MicroExecutionEngine:
         while True:
             try:
                 try:
-                    await asyncio.wait_for(self.market.tick_event.wait(), timeout=1.0)
+                    await asyncio.wait_for(
+                        self.market.tick_event.wait(),
+                        timeout=MANAGEMENT_LOOP_SLEEP,
+                    )
                 except asyncio.TimeoutError:
                     pass
                 finally:
@@ -1444,12 +1485,39 @@ class MicroExecutionEngine:
         except Exception as exc:
             log.error("[Sync] REST resync failed: %s — live WS will self-correct.", exc)
 
+    async def _run_jit_warmup(self) -> None:
+        """
+        Run Numba JIT warmup in the default ThreadPoolExecutor so the event
+        loop stays responsive.  Sets _warmup_done when complete so the
+        management loop can start building real tensors.
+        """
+        log.info(
+            "[Startup] Numba JIT warmup starting in background thread "
+            "(management loop will return zeros until complete) …"
+        )
+        await self._feature_engine.warmup_async()
+        self._warmup_done.set()
+        log.info("[Startup] Numba JIT warmup complete — management loop now active.")
+
     # ── Entry point ──────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         log.info("Starting MicroExecutionEngine — symbol=%s", self.symbol)
         log.info("Rust WS: %s  |  Demo: %s", RUST_WS_URL, self._api_config.demo)
-        log.info("All data paths: LIVE WebSocket only (no polling).")
+        log.info(
+            "Startup grace: %.0fs | Loop sleep: %.2fs | Torch threads: %d",
+            STARTUP_GRACE_SEC, MANAGEMENT_LOOP_SLEEP, _TORCH_NUM_THREADS,
+        )
+
+        # Kick off JIT warmup immediately — runs off-thread, doesn't block WS init
+        asyncio.create_task(self._run_jit_warmup())
+
+        # Brief grace period: lets the WS handshakes finish and JWT warmup
+        # get most of its work done before the management loop starts
+        # competing for CPU slices.
+        if STARTUP_GRACE_SEC > 0:
+            log.info("[Startup] Grace period %.0fs — waiting for WS + JIT …", STARTUP_GRACE_SEC)
+            await asyncio.sleep(STARTUP_GRACE_SEC)
 
         # Market stream is NOT included here — it starts dynamically in
         # _on_position_update / _rest_sync_positions when a live position exists.
