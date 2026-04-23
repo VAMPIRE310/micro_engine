@@ -2,16 +2,20 @@
 MicroAgent — headless LSTM position manager agent.
 Writes experience transitions via PyArrow → Parquet.
 Learns online via Polars lazy evaluation + QR-DQN backward pass.
+Model weights are persisted to PostgreSQL after every learning pass so
+training survives Railway redeployments.
 """
 import os
 import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import polars as pl
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from core.parquet_logger import ParquetLogger
+
+if TYPE_CHECKING:
+    from core.pg_backend import PgBackend
 
 log = logging.getLogger("MicroAgent")
 
@@ -55,13 +59,15 @@ class MicroAgent:
     _ACTION_MAP = {0: "HOLD", 1: "HEDGE", 2: "EXIT", 3: "WAVE_ADD"}
     _ACTION_IDX = {"HOLD": 0, "HEDGE": 1, "EXIT": 2, "WAVE_ADD": 3}
 
-    def __init__(self, device: str = "auto", data_dir: str = "core/data"):
+    def __init__(self, device: str = "auto", data_dir: str = "core/data",
+                 pg_backend: Optional["PgBackend"] = None):
         # Resolve "auto" → CUDA if available, else CPU
         if device == "auto" or device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
         self.data_dir = data_dir
+        self._pg      = pg_backend
         os.makedirs(self.data_dir, exist_ok=True)
         parquet_path = os.path.join(self.data_dir, "micro_experience.parquet")
 
@@ -74,14 +80,45 @@ class MicroAgent:
         self._hidden: Optional[tuple] = None
 
         # ParquetLogger: auto-flushes every 10 rows, snappy-compressed, corruption-safe.
-        self._pq_logger = ParquetLogger(filepath=parquet_path, flush_size=10)
+        # Wired to PgBackend so every flush is mirrored to PostgreSQL and the
+        # local file is seeded from PostgreSQL on a cold Railway start.
+        self._pq_logger = ParquetLogger(
+            filepath=parquet_path,
+            flush_size=10,
+            pg_backend=pg_backend,
+            table_name="micro_experience",
+        )
 
         log.info("MicroAgent initialised on %s. Parquet backend: %s", self.device, parquet_path)
 
     # ── Weights ─────────────────────────────────────────────────────────────
 
     def load_weights(self, path: str) -> None:
-        """Load locally-trained lifecycle_lstm.pt weights."""
+        """
+        Load model weights, preferring the latest PostgreSQL checkpoint so that
+        online training persists across Railway redeployments.  Falls back to
+        the local .pt file, then random initialisation.
+        """
+        # ── 1. PostgreSQL checkpoint (most recent trained weights) ───────────
+        if self._pg is not None and self._pg.available:
+            pg_state = self._pg.load_model("lifecycle_lstm")
+            if pg_state is not None:
+                model_state = self.model.state_dict()
+                compatible  = {
+                    k: v for k, v in pg_state.items()
+                    if k in model_state and v.shape == model_state[k].shape
+                }
+                skipped = [k for k in pg_state if k not in compatible]
+                if skipped:
+                    log.warning(
+                        "Skipped %d PG checkpoint key(s) with incompatible shapes: %s",
+                        len(skipped), skipped,
+                    )
+                self.model.load_state_dict(compatible, strict=False)
+                log.info("Model weights loaded from PostgreSQL checkpoint.")
+                return
+
+        # ── 2. Local .pt file ────────────────────────────────────────────────
         if os.path.exists(path):
             state = torch.load(path, map_location=self.device, weights_only=True)
             model_state = self.model.state_dict()
@@ -152,15 +189,22 @@ class MicroAgent:
         self._pq_logger.flush()
 
     def _learn_from_parquet(self) -> None:
-        """Polars lazy tail-read → QR-DQN backward pass."""
-        path = self._pq_logger.filepath
-        if not os.path.exists(path):
+        """
+        QR-DQN backward pass over the most recent 256 experience rows.
+
+        Reads via ParquetLogger.read_polars() which merges:
+          1. local parquet file (fast, already written)
+          2. in-memory buffer   (rows not yet flushed)
+          3. PostgreSQL         (historical rows from previous Railway deploys,
+                                 via cold-start seed — no extra query at runtime)
+
+        After a successful pass the updated weights are saved to PostgreSQL
+        so training survives the next redeployment.
+        """
+        df = self._pq_logger.read_polars(256)
+        if len(df) < 32:
             return
         try:
-            df = pl.scan_parquet(path).tail(256).collect()
-            if len(df) < 32:
-                return
-
             self.model.train()
 
             state_t = torch.tensor(
@@ -185,6 +229,15 @@ class MicroAgent:
             self.optimizer.step()
             self.model.eval()
 
-            log.debug("Online learning pass complete. Loss: %.4f", loss.item())
+            log.debug("Online learning pass complete. Loss: %.4f  rows: %d",
+                      loss.item(), len(df))
+
+            # Persist updated weights to PostgreSQL so the next Railway deploy
+            # starts from the trained state rather than the static .pt file.
+            if self._pg is not None and self._pg.available:
+                self._pg.save_model("lifecycle_lstm", self.model.state_dict())
+
         except Exception as exc:
             log.error("Polars learning loop failed: %s", exc)
+            # Restore eval mode so inference is unaffected by the failed pass.
+            self.model.eval()

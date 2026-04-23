@@ -56,6 +56,13 @@ ntplib>=0.4,<1.0
 redis>=5.0,<6.0
 
 # -----------------------------------------------------------
+# PostgreSQL — persistent experience replay + model checkpoints
+# Railway injects DATABASE_URL automatically when a Postgres
+# service is linked via a Reference Variable.
+# -----------------------------------------------------------
+psycopg2-binary>=2.9,<4.0
+
+# -----------------------------------------------------------
 # Webhook server (optional — used by WebhookOrderRouter in rsa_auth)
 # -----------------------------------------------------------
 flask>=2.3.2,<4.0

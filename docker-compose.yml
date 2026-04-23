@@ -96,6 +96,12 @@ services:
       RUST_WS_URL: "ws://bybit-ingester:8080"   # primary market-data feed
       REDIS_URL: "redis://redis:6379"
 
+      # ── PostgreSQL — persistent experience replay + model checkpoints ──
+      # On Railway, use a Reference Variable so the services appear connected
+      # in the canvas:  DATABASE_URL = ${{Postgres.DATABASE_URL}}
+      # For local dev, set this in your .env file or leave empty to disable.
+      DATABASE_URL: "${DATABASE_URL:-}"
+
       # ── Tuning ─────────────────────────────────────────
       HEDGE_TRIGGER_LOSS_USDT: "${HEDGE_TRIGGER_LOSS_USDT:--15.0}"
       PROFIT_BUFFER_USDT: "${PROFIT_BUFFER_USDT:-0.5}"
