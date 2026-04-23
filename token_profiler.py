@@ -1,5 +1,5 @@
-import os
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+8import os
+
 import logging
 from typing import Dict, List, Any
 
