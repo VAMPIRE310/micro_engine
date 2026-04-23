@@ -239,4 +239,5 @@ class MicroAgent:
 
         except Exception as exc:
             log.error("Polars learning loop failed: %s", exc)
+            # Restore eval mode so inference is unaffected by the failed pass.
             self.model.eval()

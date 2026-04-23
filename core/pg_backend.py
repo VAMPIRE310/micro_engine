@@ -144,13 +144,13 @@ class PgBackend:
                 cur.execute(
                     "SELECT data FROM parquet_logs"
                     " WHERE table_name = %s"
-                    " ORDER BY id DESC LIMIT %s",
+                    " ORDER BY id ASC LIMIT %s",
                     (table_name, limit),
                 )
                 rows = [r[0] for r in cur.fetchall()]
             if not rows:
                 return pl.DataFrame()
-            return pl.DataFrame(rows[::-1])   # reverse to oldest-first
+            return pl.DataFrame(rows)
         except Exception as exc:
             log.warning("[PgBackend] read_rows('%s') failed: %s", table_name, exc)
             self._rollback_and_reset()
