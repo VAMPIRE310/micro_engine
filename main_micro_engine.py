@@ -62,18 +62,54 @@ import os
 import time
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
-
-import numpy as np
-import redis
-import torch
+import sys
+import signalimport numpy as np
+import argparseimport redis
+import threadingimport torch
 
 from security.rsa_auth import APIConfig, BybitV5Client
 from core.agents.micro_agent import MicroAgent
+from core.agents.forecaster_agent import ForecasterAgent
+from core.agents.negotiator_agent import NegotiatorAgent
+from core.agents.position_manager_agent import PositionManagerAgent
+from core.agents.strike_agent import StrikeAgent
 from core.feature_engine_v2 import FeatureEngineV2
 from core.hybrid_volume_trailing import HybridVolumeTrailingStop, HybridStopConfig, TrailingDirection
 from core.token_profiler import TokenProfiler
 from core.pg_backend import PgBackend
+# ─── Weight Sync ───
+try:
+    from local.weight_sync import WeightSyncDaemon, pull_weights, load_into_model
+    WEIGHT_SYNC_AVAILABLE = True
+except ImportError:
+    WEIGHT_SYNC_AVAILABLE = False
 
+# ─── Data Engine ───
+from core.Data_handlers.feature_engine_v2 import FeatureEngineV2
+
+# ─── Execution ───
+from api.bybit_client import get_shared_client
+
+# ─── Core & Satellite Bridge (Rust → Python execution relay) ───
+try:
+    from core.strategy.core_satellite_bridge import ExecutionBridge, get_execution_bridge
+    EXECUTION_BRIDGE_AVAILABLE = True
+except ImportError:
+    EXECUTION_BRIDGE_AVAILABLE = False
+
+# ─── Railway Ingestion Hook (PostgreSQL → GPU training data) ───
+try:
+    from local.ingest_railway import RailwayIngestionHook, get_ingestion_hook
+    INGESTION_AVAILABLE = True
+except ImportError:
+    INGESTION_AVAILABLE = False
+
+# ─── API Server ───
+try:
+    from api.api_server import start_api_server
+    API_SERVER_AVAILABLE = True
+except ImportError:
+    API_SERVER_AVAILABLE = False
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

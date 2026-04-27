@@ -1,0 +1,1197 @@
+/*!
+NEO SUPREME — Portfolio State Manager (Rust)
+=============================================
+Single source of truth for position state + ALL sizing math.
+
+Architecture Law:
+    Rust  = Core/Wave/Hedge state tracking + ALL sizing calculations
+    Python bybit_client = dumb execution muscle, zero math, pure API relay
+
+*/
+
+use std::time::{Duration};
+use std::sync::atomic::Ordering;
+
+use anyhow::{Context, Result};
+use dashmap::DashMap;
+use flume::{Sender};
+use futures_util::StreamExt; // Required for Redis pub/sub streams
+use serde::{Deserialize, Serialize};
+use tokio::time::{interval, sleep};
+use tracing::{info, trace, warn};
+use uuid::Uuid;
+
+// =============================================================================
+// Types & Enums
+// =============================================================================
+
+/// Classification of a position leg
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LegType {
+    /// HTF macro position — the "Core" in Core & Satellite
+    Core,
+    /// LTF wave addition — scaled into an existing core trend
+    Wave,
+    /// Counter-position hedge — activated during drawdown recovery
+    Hedge,
+}
+
+/// Individual position leg (Core, Wave, or Hedge)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionLeg {
+    pub leg_type: LegType,
+    pub side: String,         // "Buy" (Long) or "Sell" (Short) — Bybit format
+    pub size: f64,            // Notional size in base currency
+    pub entry_price: f64,
+    pub entry_ts_ms: i64,
+    pub ticket_id: String,    // UUID for tracking fills
+    pub hedge_tier: u8,       // 0 = not a hedge, 1/2/3 = recovery tier
+}
+
+impl PositionLeg {
+    /// Calculate unrealized PnL at current price
+    pub fn unrealized_pnl(&self, current_price: f64) -> f64 {
+        if self.side == "Buy" {
+            (current_price - self.entry_price) * self.size
+        } else {
+            (self.entry_price - current_price) * self.size
+        }
+    }
+
+    /// Notional value at given price
+    pub fn notional(&self, price: f64) -> f64 {
+        self.size * price
+    }
+}
+
+/// Per-symbol position state — tracks Core, Waves, and Hedges independently
+#[derive(Debug, Clone)]
+pub struct SymbolState {
+    pub symbol: String,
+    /// The Core HTF position
+    pub core: Option<PositionLeg>,
+    /// LTF wave additions (max 3)
+    pub waves: Vec<PositionLeg>,
+    /// Recovery hedge tiers (max 3)
+    pub hedges: Vec<PositionLeg>,
+    /// Highest price since core entry (for LONG drawdown calc)
+    pub peak_price: f64,
+    /// Lowest price since core entry (for SHORT drawdown calc)
+    pub trough_price: f64,
+    /// Timestamp of last entry decision (cooldown enforcement)
+    pub last_decision_ts_ms: i64,
+    /// Highest hedge tier currently active (0 = none)
+    pub hedge_tier_active: u8,
+    /// Cached current price
+    pub current_price: f64,
+    /// Timestamp of last price update
+    pub last_price_ts_ms: i64,
+}
+
+impl Default for SymbolState {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            core: None,
+            waves: Vec::new(),
+            hedges: Vec::new(),
+            peak_price: 0.0,
+            trough_price: f64::MAX,
+            last_decision_ts_ms: 0,
+            hedge_tier_active: 0,
+            current_price: 0.0,
+            last_price_ts_ms: 0,
+        }
+    }
+}
+
+impl SymbolState {
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            ..Default::default()
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// Whether the core is a LONG position
+    fn core_is_long(&self) -> bool {
+        self.core.as_ref().map(|c| c.side == "Buy").unwrap_or(false)
+    }
+
+    /// Whether the core is a SHORT position
+    fn core_is_short(&self) -> bool {
+        self.core.as_ref().map(|c| c.side == "Sell").unwrap_or(false)
+    }
+
+    /// Whether we have an open core position
+    fn has_core(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// Current drawdown % from peak (for LONG) or trough (for SHORT)
+    fn drawdown_pct(&self) -> f64 {
+        if !self.has_core() || self.current_price <= 0.0 {
+            return 0.0;
+        }
+        if self.core_is_long() && self.peak_price > 0.0 {
+            (self.peak_price - self.current_price) / self.peak_price
+        } else if self.core_is_short() && self.trough_price < f64::MAX {
+            (self.current_price - self.trough_price) / self.trough_price
+        } else {
+            0.0
+        }
+    }
+
+    /// Total core size (absolute)
+    pub fn core_size(&self) -> f64 {
+        self.core.as_ref().map(|c| c.size).unwrap_or(0.0)
+    }
+
+    /// Update peak/trough tracking when price changes
+    fn update_price_extremes(&mut self, price: f64) {
+        self.current_price = price;
+        self.last_price_ts_ms = chrono::Utc::now().timestamp_millis();
+        if self.core_is_long() {
+            if price > self.peak_price {
+                self.peak_price = price;
+            }
+        } else if self.core_is_short() {
+            if price < self.trough_price {
+                self.trough_price = price;
+            }
+        }
+    }
+
+    /// Net combined PnL across core + waves + hedges
+    fn net_combined_pnl(&self) -> f64 {
+        let core_pnl = self.core.as_ref()
+            .map(|c| c.unrealized_pnl(self.current_price))
+            .unwrap_or(0.0);
+        let wave_pnls: f64 = self.waves.iter()
+            .map(|w| w.unrealized_pnl(self.current_price))
+            .sum();
+        let hedge_pnls: f64 = self.hedges.iter()
+            .map(|h| h.unrealized_pnl(self.current_price))
+            .sum();
+        core_pnl + wave_pnls + hedge_pnls
+    }
+
+    /// Format quantity to instrument step size
+    fn format_qty(qty: f64, step: f64) -> String {
+        if step <= 0.0 {
+            return format!("{:.8}", qty);
+        }
+        let decimals = if step >= 1.0 {
+            0
+        } else {
+            (-step.log10()).ceil() as usize
+        };
+        let rounded = (qty / step).floor() * step;
+        format!("{:.1$}", rounded, decimals)
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // AI DECISION PROCESSING
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// Process an AI decision and return execution payloads.
+    pub fn process_ai_decision(
+        &mut self,
+        bias: &str,             // "LONG", "SHORT", "NEUTRAL"
+        action_code: u8,        // 0=HOLD 1=trail 2=close_core 3=wave_add 4=hedge 5=close_wave 6=merge
+        sizing_fraction: f64,   // 0.0-1.0 from SAC Negotiator
+        confidence: f64,
+        current_price: f64,
+        available_margin_usdt: f64,
+        base_qty_step: f64,
+    ) -> Vec<ExecutionPayload> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.update_price_extremes(current_price);
+
+        let mut payloads: Vec<ExecutionPayload> = Vec::new();
+
+        // ── Cooldown check ─────────────────────────────────────────────────
+        let is_entry = matches!(action_code, 1 | 3); // adjust_trail or wave_add
+        if is_entry {
+            let elapsed_ms = now_ms - self.last_decision_ts_ms;
+            if elapsed_ms < 30_000 {
+                trace!(
+                    "{} cooldown active ({}ms remaining)",
+                    self.symbol, 30_000 - elapsed_ms
+                );
+                return payloads;
+            }
+        }
+
+        // ── Action routing ─────────────────────────────────────────────────
+        match action_code {
+            // wave_add — add to existing core position
+            3 if self.has_core() => {
+                if self.waves.len() >= 3 {
+                    warn!("{} max 3 waves reached — rejecting wave_add", self.symbol);
+                    return payloads;
+                }
+
+                let wave_size = sizing_fraction * available_margin_usdt * confidence * 0.20;
+                // Cap wave at 20% of available margin, min $10
+                if wave_size * current_price < 10.0 {
+                    trace!("{} wave size too small ({}), skipping", self.symbol, wave_size);
+                    return payloads;
+                }
+
+                let side = if self.core_is_long() { "Buy" } else { "Sell" };
+                let ticket_id = Uuid::new_v4().to_string();
+
+                payloads.push(ExecutionPayload {
+                    symbol: self.symbol.clone(),
+                    side: side.to_string(),
+                    qty: Self::format_qty(wave_size, base_qty_step),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: if side == "Buy" { 1 } else { 2 },
+                    reduce_only: false,
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: true,
+                    is_hedge: false,
+                    hedge_tier: 0,
+                    ticket_id: ticket_id.clone(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!(
+                        "Wave add #{} | {} {} | size={:.4} | conf={:.2}",
+                        self.waves.len() + 1, self.symbol, side, wave_size, confidence
+                    ),
+                    timestamp_ms: now_ms,
+                });
+
+                self.waves.push(PositionLeg {
+                    leg_type: LegType::Wave,
+                    side: side.to_string(),
+                    size: wave_size,
+                    entry_price: current_price,
+                    entry_ts_ms: now_ms,
+                    ticket_id,
+                    hedge_tier: 0,
+                });
+
+                self.last_decision_ts_ms = now_ms;
+                info!(
+                    "{} wave_add #{} | size={:.4} | conf={:.2}",
+                    self.symbol, self.waves.len(), wave_size, confidence
+                );
+            }
+
+            // adjust_trail (action 1) or new Core entry
+            1 | 3 if !self.has_core() => {
+                if confidence < 0.75 {
+                    trace!("{} insufficient confidence ({:.2}) for core entry", self.symbol, confidence);
+                    return payloads;
+                }
+
+                // Core sizing: max 40% of available margin
+                let core_size = sizing_fraction * available_margin_usdt * 0.40;
+                if core_size * current_price < 10.0 {
+                    trace!("{} core size too small, skipping", self.symbol);
+                    return payloads;
+                }
+
+                let side = if bias == "LONG" || bias == "long" { "Buy" } else { "Sell" };
+                let ticket_id = Uuid::new_v4().to_string();
+
+                payloads.push(ExecutionPayload {
+                    symbol: self.symbol.clone(),
+                    side: side.to_string(),
+                    qty: Self::format_qty(core_size, base_qty_step),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: if side == "Buy" { 1 } else { 2 },
+                    reduce_only: false,
+                    close_on_trigger: false,
+                    is_core: true,
+                    is_wave_add: false,
+                    is_hedge: false,
+                    hedge_tier: 0,
+                    ticket_id: ticket_id.clone(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!(
+                        "Core entry | {} {} | size={:.4} | conf={:.2} | bias={}",
+                        self.symbol, side, core_size, confidence, bias
+                    ),
+                    timestamp_ms: now_ms,
+                });
+
+                self.core = Some(PositionLeg {
+                    leg_type: LegType::Core,
+                    side: side.to_string(),
+                    size: core_size,
+                    entry_price: current_price,
+                    entry_ts_ms: now_ms,
+                    ticket_id,
+                    hedge_tier: 0,
+                });
+                self.peak_price = current_price;
+                self.trough_price = current_price;
+                self.last_decision_ts_ms = now_ms;
+
+                info!(
+                    "{} core OPEN | {} | size={:.4} | entry={:.2} | conf={:.2}",
+                    self.symbol, side, core_size, current_price, confidence
+                );
+            }
+
+            // close_core — close the core position
+            2 if self.has_core() => {
+                if let Some(ref core) = self.core {
+                    payloads.push(ExecutionPayload {
+                        symbol: self.symbol.clone(),
+                        side: if core.side == "Buy" { "Sell" } else { "Buy" }.to_string(),
+                        qty: Self::format_qty(core.size, base_qty_step),
+                        order_type: "Market".to_string(),
+                        price: None,
+                        position_idx: if core.side == "Buy" { 1 } else { 2 },
+                        reduce_only: true,
+                        close_on_trigger: true,
+                        is_core: true,
+                        is_wave_add: false,
+                        is_hedge: false,
+                        hedge_tier: 0,
+                        ticket_id: core.ticket_id.clone(),
+                        tp_price: None,
+                        sl_price: None,
+                        reason: format!(
+                            "Core close | {} | pnl={:.2}",
+                            self.symbol, core.unrealized_pnl(current_price)
+                        ),
+                        timestamp_ms: now_ms,
+                    });
+
+                    info!(
+                        "{} core CLOSE | pnl={:.2}",
+                        self.symbol, core.unrealized_pnl(current_price)
+                    );
+                }
+            }
+
+            // hedge — manual hedge trigger
+            4 if self.has_core() => {
+                // Trigger hedged recovery immediately
+                let hedge_payloads = self.check_hedged_recovery(
+                    current_price, available_margin_usdt, base_qty_step
+                );
+                payloads.extend(hedge_payloads);
+            }
+
+            // close_wave — close all wave additions
+            5 => {
+                for wave in &self.waves {
+                    payloads.push(ExecutionPayload {
+                        symbol: self.symbol.clone(),
+                        side: if wave.side == "Buy" { "Sell" } else { "Buy" }.to_string(),
+                        qty: Self::format_qty(wave.size, base_qty_step),
+                        order_type: "Market".to_string(),
+                        price: None,
+                        position_idx: if wave.side == "Buy" { 1 } else { 2 },
+                        reduce_only: true,
+                        close_on_trigger: false,
+                        is_core: false,
+                        is_wave_add: true,
+                        is_hedge: false,
+                        hedge_tier: 0,
+                        ticket_id: wave.ticket_id.clone(),
+                        tp_price: None,
+                        sl_price: None,
+                        reason: format!(
+                            "Wave close | {} | pnl={:.2}",
+                            self.symbol, wave.unrealized_pnl(current_price)
+                        ),
+                        timestamp_ms: now_ms,
+                    });
+                }
+            }
+
+            // merge_wave — merge waves into core
+            6 if self.has_core() => {
+                let total_wave_size: f64 = self.waves.iter().map(|w| w.size).sum();
+                if self.core.is_some() {
+                    // Conceptually merge — in practice we close waves and the core absorbs
+                    for wave in &self.waves {
+                        payloads.push(ExecutionPayload {
+                            symbol: self.symbol.clone(),
+                            side: if wave.side == "Buy" { "Sell" } else { "Buy" }.to_string(),
+                            qty: Self::format_qty(wave.size, base_qty_step),
+                            order_type: "Market".to_string(),
+                            price: None,
+                            position_idx: if wave.side == "Buy" { 1 } else { 2 },
+                            reduce_only: true,
+                            close_on_trigger: false,
+                            is_core: false,
+                            is_wave_add: true,
+                            is_hedge: false,
+                            hedge_tier: 0,
+                            ticket_id: wave.ticket_id.clone(),
+                            tp_price: None,
+                            sl_price: None,
+                            reason: format!("Wave merge into core | {}", self.symbol),
+                            timestamp_ms: now_ms,
+                        });
+                    }
+                    info!(
+                        "{} merged {} waves (total size={:.4}) into core",
+                        self.symbol, self.waves.len(), total_wave_size
+                    );
+                }
+            }
+
+            _ => {
+                // HOLD or invalid action — no-op
+                trace!("{} action={} → no execution", self.symbol, action_code);
+            }
+        }
+
+        payloads
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // HEDGED RECOVERY
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// Check drawdown and activate hedged recovery tiers.
+    pub fn check_hedged_recovery(
+        &mut self,
+        current_price: f64,
+        available_margin_usdt: f64,
+        base_qty_step: f64,
+    ) -> Vec<ExecutionPayload> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.update_price_extremes(current_price);
+
+        let mut payloads: Vec<ExecutionPayload> = Vec::new();
+
+        if !self.has_core() {
+            return payloads;
+        }
+
+        let dd = self.drawdown_pct();
+        let core = self.core.as_ref().unwrap();
+
+        // Tier thresholds and hedge percentages
+        let tiers: [(f64, f64, u8); 3] = [
+            (0.005, 0.50, 1), // Tier 1: 0.5% DD → 50% hedge
+            (0.010, 0.25, 2), // Tier 2: 1.0% DD → additional 25% (total 75%)
+            (0.015, 0.25, 3), // Tier 3: 1.5% DD → additional 25% (total 100%)
+        ];
+
+        for (threshold, pct, tier) in tiers {
+            if dd >= threshold && self.hedge_tier_active < tier {
+                // Activate this tier
+                let hedge_size = core.size * pct;
+
+                // Check margin availability
+                let required_margin = hedge_size * current_price;
+                if required_margin > available_margin_usdt * 0.5 {
+                    warn!(
+                        "{} hedge tier {}: insufficient margin ({:.2} required, {:.2} available)",
+                        self.symbol, tier, required_margin, available_margin_usdt * 0.5
+                    );
+                    continue;
+                }
+
+                // Hedge is opposite side to core
+                let hedge_side = if core.side == "Buy" { "Sell" } else { "Buy" };
+                let ticket_id = Uuid::new_v4().to_string();
+
+                payloads.push(ExecutionPayload {
+                    symbol: self.symbol.clone(),
+                    side: hedge_side.to_string(),
+                    qty: Self::format_qty(hedge_size, base_qty_step),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: if hedge_side == "Buy" { 1 } else { 2 },
+                    reduce_only: false,
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: false,
+                    is_hedge: true,
+                    hedge_tier: tier,
+                    ticket_id: ticket_id.clone(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!(
+                        "HEDGE TIER {} | {} drawdown={:.2}% | size={:.4} | {} side",
+                        tier, self.symbol, dd * 100.0, hedge_size, hedge_side
+                    ),
+                    timestamp_ms: now_ms,
+                });
+
+                self.hedges.push(PositionLeg {
+                    leg_type: LegType::Hedge,
+                    side: hedge_side.to_string(),
+                    size: hedge_size,
+                    entry_price: current_price,
+                    entry_ts_ms: now_ms,
+                    ticket_id,
+                    hedge_tier: tier,
+                });
+
+                self.hedge_tier_active = tier;
+
+                warn!(
+                    "{} HEDGE ACTIVATED tier={} | dd={:.2}% | size={:.4} | side={}",
+                    self.symbol, tier, dd * 100.0, hedge_size, hedge_side
+                );
+            }
+        }
+
+        payloads
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // NET-POSITIVE EXIT
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// If core + hedges open AND net combined PnL > 0:
+    pub fn check_net_positive_exit(
+        &mut self,
+        current_price: f64,
+    ) -> Vec<ExecutionPayload> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.update_price_extremes(current_price);
+
+        let mut payloads: Vec<ExecutionPayload> = Vec::new();
+
+        if self.hedges.is_empty() && self.waves.is_empty() {
+            return payloads;
+        }
+
+        if !self.has_core() {
+            return payloads;
+        }
+
+        let net_pnl = self.net_combined_pnl();
+
+        if net_pnl > 0.0 {
+            info!(
+                "{} NET-POSITIVE achieved | pnl={:.2} | closing hedges + waves, keeping core",
+                self.symbol, net_pnl
+            );
+
+            // Close hedges first
+            for hedge in &self.hedges {
+                payloads.push(ExecutionPayload {
+                    symbol: self.symbol.clone(),
+                    side: if hedge.side == "Buy" { "Sell" } else { "Buy" }.to_string(),
+                    qty: Self::format_qty(hedge.size, 0.0001),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: if hedge.side == "Buy" { 1 } else { 2 },
+                    reduce_only: true,
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: false,
+                    is_hedge: true,
+                    hedge_tier: hedge.hedge_tier,
+                    ticket_id: hedge.ticket_id.clone(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!(
+                        "Net-positive exit | close hedge tier {} | {} | pnl={:.2}",
+                        hedge.hedge_tier, self.symbol, hedge.unrealized_pnl(current_price)
+                    ),
+                    timestamp_ms: now_ms,
+                });
+            }
+
+            // Close waves
+            for wave in &self.waves {
+                payloads.push(ExecutionPayload {
+                    symbol: self.symbol.clone(),
+                    side: if wave.side == "Buy" { "Sell" } else { "Buy" }.to_string(),
+                    qty: Self::format_qty(wave.size, 0.0001),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: if wave.side == "Buy" { 1 } else { 2 },
+                    reduce_only: true,
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: true,
+                    is_hedge: false,
+                    hedge_tier: 0,
+                    ticket_id: wave.ticket_id.clone(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!(
+                        "Net-positive exit | close wave | {} | pnl={:.2}",
+                        self.symbol, wave.unrealized_pnl(current_price)
+                    ),
+                    timestamp_ms: now_ms,
+                });
+            }
+        }
+
+        payloads
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // FILL CONFIRMATION
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// Called when a fill is confirmed for a ticket_id.
+    pub fn on_close_confirmed(&mut self, ticket_id: &str) {
+        let mut removed = false;
+
+        // Check core
+        if let Some(ref core) = self.core {
+            if core.ticket_id == ticket_id {
+                info!("{} core CLOSED (ticket={})", self.symbol, ticket_id);
+                self.core = None;
+                removed = true;
+                // Reset all state since core is gone
+                self.peak_price = 0.0;
+                self.trough_price = f64::MAX;
+                self.hedge_tier_active = 0;
+                self.last_decision_ts_ms = 0;
+            }
+        }
+
+        // Check waves
+        if let Some(idx) = self.waves.iter().position(|w| w.ticket_id == ticket_id) {
+            let wave = self.waves.remove(idx);
+            info!("{} wave CLOSED (ticket={}, pnl={:.2})", self.symbol, ticket_id,
+                  wave.unrealized_pnl(self.current_price));
+            removed = true;
+        }
+
+        // Check hedges
+        if let Some(idx) = self.hedges.iter().position(|h| h.ticket_id == ticket_id) {
+            let hedge = self.hedges.remove(idx);
+            info!("{} hedge CLOSED tier={} (ticket={})", self.symbol, hedge.hedge_tier, ticket_id);
+
+            // Recalculate highest active hedge tier
+            self.hedge_tier_active = self.hedges.iter()
+                .map(|h| h.hedge_tier)
+                .max()
+                .unwrap_or(0);
+
+            removed = true;
+        }
+
+        if !removed {
+            warn!("{} on_close_confirmed: ticket_id {} not found", self.symbol, ticket_id);
+        }
+    }
+
+    /// Get a snapshot of current state for monitoring
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "symbol": self.symbol,
+            "has_core": self.has_core(),
+            "core_side": self.core.as_ref().map(|c| &c.side),
+            "core_size": self.core_size(),
+            "core_notional": self.core.as_ref().map(|c| c.notional(self.current_price)),
+            "core_entry": self.core.as_ref().map(|c| c.entry_price),
+            "wave_count": self.waves.len(),
+            "hedge_count": self.hedges.len(),
+            "hedge_tier_active": self.hedge_tier_active,
+            "current_price": self.current_price,
+            "last_price_ts_ms": self.last_price_ts_ms,
+            "peak_price": self.peak_price,
+            "drawdown_pct": self.drawdown_pct(),
+            "net_pnl": self.net_combined_pnl(),
+            "waves": self.waves.iter().map(|w| {
+                serde_json::json!({
+                    "side": w.side,
+                    "size": w.size,
+                    "notional": w.notional(self.current_price),
+                    "entry": w.entry_price,
+                    "ticket": w.ticket_id,
+                })
+            }).collect::<Vec<_>>(),
+            "hedges": self.hedges.iter().map(|h| {
+                serde_json::json!({
+                    "side": h.side,
+                    "size": h.size,
+                    "notional": h.notional(self.current_price),
+                    "entry": h.entry_price,
+                    "tier": h.hedge_tier,
+                    "ticket": h.ticket_id,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+// =============================================================================
+// Execution Payload (Rust → Python bybit_client)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPayload {
+    pub symbol: String,
+    pub side: String,               // "Buy" or "Sell" — Bybit format
+    pub qty: String,                // Formatted to tick size, as string
+    pub order_type: String,         // "Market" or "Limit"
+    pub price: Option<String>,      // None for Market orders
+    pub position_idx: u8,           // 1 = long side, 2 = short side (hedge mode)
+    pub reduce_only: bool,
+    pub close_on_trigger: bool,
+    pub is_core: bool,
+    pub is_wave_add: bool,
+    pub is_hedge: bool,
+    pub hedge_tier: u8,
+    pub ticket_id: String,
+    pub tp_price: Option<String>,
+    pub sl_price: Option<String>,
+    pub reason: String,
+    pub timestamp_ms: i64,
+}
+
+// =============================================================================
+// Portfolio State Manager (Top-Level)
+// =============================================================================
+
+/// Top-level manager that owns all SymbolStates and runs the decision/risk loops.
+pub struct PortfolioStateManager {
+    states: DashMap<String, SymbolState>,
+    redis_url: String,
+    execution_tx: Sender<ExecutionPayload>,
+    available_margin_usdt: std::sync::atomic::AtomicU64,
+    default_qty_step: f64,
+}
+
+impl PortfolioStateManager {
+    pub fn new(
+        redis_url: impl Into<String>,
+        execution_tx: Sender<ExecutionPayload>,
+    ) -> Self {
+        Self {
+            states: DashMap::new(),
+            redis_url: redis_url.into(),
+            execution_tx,
+            available_margin_usdt: std::sync::atomic::AtomicU64::from(100_000), // $100 default
+            default_qty_step: 0.001,
+        }
+    }
+
+    /// Get or create SymbolState for a symbol
+    fn get_or_create(&self, symbol: &str) -> dashmap::mapref::one::RefMut<'_, String, SymbolState> {
+        self.states.entry(symbol.to_string())
+            .or_insert_with(|| SymbolState::new(symbol))
+    }
+
+    /// Store available margin for caching (avoids Redis round-trip)
+    fn store_available_margin(&self, margin: f64) {
+        self.available_margin_usdt.store(margin.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Get cached available margin
+    fn cached_available_margin(&self) -> f64 {
+        f64::from_bits(self.available_margin_usdt.load(Ordering::Relaxed))
+    }
+
+    /// Lightweight tick update — sets current_price and last_price_ts_ms
+    pub fn update_tick_price(&self, symbol: &str, price: f64) {
+        let mut s = self.get_or_create(symbol);
+        s.current_price = price;
+        s.last_price_ts_ms = chrono::Utc::now().timestamp_millis();
+    }
+
+    /// Age of last price update in milliseconds
+    pub fn last_price_age_ms(&self, symbol: &str) -> Option<i64> {
+        self.states.get(symbol).map(|s| {
+            let now = chrono::Utc::now().timestamp_millis();
+            now - s.last_price_ts_ms
+        })
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // DECISION LOOP
+    // ═════════════════════════════════════════════════════════════════════════
+
+    pub async fn run_decision_loop(&self) -> Result<()> {
+        info!("PortfolioStateManager decision loop starting");
+
+        loop {
+            let client = redis::Client::open(self.redis_url.as_str())
+                .context("Failed to open Redis for decision loop")?;
+
+            let conn = client.get_async_connection()
+                .await
+                .context("Failed to get Redis async connection for decision loop")?;
+
+            let mut pubsub = conn.into_pubsub();
+            pubsub.psubscribe("brain:decision:*").await?;
+
+            info!("Decision loop subscribed to brain:decision:*");
+
+            let mut msg_stream = pubsub.on_message();
+
+            loop {
+                match msg_stream.next().await {
+                    Some(msg) => {
+                        let channel: String = msg.get_pattern::<String>().unwrap_or_default();
+                        let payload: String = msg.get_payload::<String>().unwrap_or_default();
+
+                        let symbol = channel.strip_prefix("brain:decision:")
+                            .unwrap_or("")
+                            .to_string();
+
+                        if symbol.is_empty() {
+                            continue;
+                        }
+
+                        if let Err(e) = self.handle_decision_message(&symbol, &payload).await {
+                            warn!("Decision processing error for {}: {}", symbol, e);
+                        }
+                    }
+                    None => {
+                        warn!("Redis pubsub stream ended, reconnecting...");
+                        sleep(Duration::from_secs(2)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_decision_message(&self, symbol: &str, payload: &str) -> Result<()> {
+        let decision: serde_json::Value = serde_json::from_str(payload)
+            .context("Failed to parse decision JSON")?;
+
+        let bias = decision["directional_bias"].as_str().unwrap_or("NEUTRAL");
+        let action_code = decision["action"].as_u64().unwrap_or(0) as u8;
+        let sizing = decision["position_size"].as_f64().unwrap_or(0.0);
+        let confidence = decision["confidence_score"].as_f64().unwrap_or(0.0);
+
+        let current_price = self.get_current_price(symbol).await.unwrap_or(0.0);
+        if current_price <= 0.0 {
+            warn!("{} no current price available, skipping decision", symbol);
+            return Ok(());
+        }
+
+        let margin = self.get_available_margin().await;
+        self.store_available_margin(margin);
+        let qty_step = self.get_qty_step(symbol).await;
+
+        let payloads = {
+            let mut state = self.get_or_create(symbol);
+            state.process_ai_decision(
+                bias, action_code, sizing, confidence,
+                current_price, margin, qty_step,
+            )
+        };
+
+        for payload in payloads {
+            self.send_execution_payload(symbol, &payload).await?;
+        }
+
+        Ok(())
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // RISK LOOP
+    // ═════════════════════════════════════════════════════════════════════════
+
+    pub async fn run_risk_loop(&self) -> Result<()> {
+        info!("PortfolioStateManager risk loop starting (500ms interval)");
+        let mut ticker = interval(Duration::from_millis(500));
+
+        loop {
+            ticker.tick().await;
+
+            let symbols: Vec<String> = self.states.iter()
+                .filter(|entry| entry.has_core() || !entry.hedges.is_empty())
+                .map(|entry| entry.symbol.clone())
+                .collect();
+
+            for symbol in symbols {
+                if let Err(e) = self.run_risk_check(&symbol).await {
+                    trace!("Risk check error for {}: {}", symbol, e);
+                }
+            }
+        }
+    }
+
+    async fn run_risk_check(&self, symbol: &str) -> Result<()> {
+        let current_price = self.get_current_price(symbol).await?;
+        let margin = self.get_available_margin().await;
+        self.store_available_margin(margin);
+        let qty_step = self.get_qty_step(symbol).await;
+
+        let payloads = {
+            let mut state = self.get_or_create(symbol);
+            state.update_price_extremes(current_price);
+
+            let mut all_payloads = Vec::new();
+            let hedge_payloads = state.check_hedged_recovery(current_price, margin, qty_step);
+            all_payloads.extend(hedge_payloads);
+            let exit_payloads = state.check_net_positive_exit(current_price);
+            all_payloads.extend(exit_payloads);
+
+            all_payloads
+        };
+
+        for payload in payloads {
+            self.send_execution_payload(symbol, &payload).await?;
+        }
+
+        Ok(())
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // FILL LISTENER
+    // ═════════════════════════════════════════════════════════════════════════
+
+    pub async fn run_fill_listener(&self) -> Result<()> {
+        info!("PortfolioStateManager fill listener starting");
+
+        loop {
+            let client = redis::Client::open(self.redis_url.as_str())
+                .context("Failed to open Redis for fill listener")?;
+
+            let conn = client.get_async_connection()
+                .await
+                .context("Failed to get Redis async connection for fill listener")?;
+
+            let mut pubsub = conn.into_pubsub();
+            pubsub.psubscribe("execution:fill_confirmed:*").await?;
+
+            info!("Fill listener subscribed to execution:fill_confirmed:*");
+
+            let mut msg_stream = pubsub.on_message();
+
+            loop {
+                match msg_stream.next().await {
+                    Some(msg) => {
+                        let payload: String = msg.get_payload::<String>().unwrap_or_default();
+                        if let Err(e) = self.handle_fill_message(&payload).await {
+                            warn!("Fill processing error: {}", e);
+                        }
+                    }
+                    None => {
+                        warn!("Fill listener pubsub stream ended, reconnecting...");
+                        sleep(Duration::from_secs(2)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_fill_message(&self, payload: &str) -> Result<()> {
+        let fill: serde_json::Value = serde_json::from_str(payload)
+            .context("Failed to parse fill confirmation JSON")?;
+
+        let ticket_id = fill["ticket_id"].as_str()
+            .context("Missing ticket_id in fill confirmation")?;
+
+        for entry in self.states.iter() {
+            if entry.core.as_ref().map(|c| c.ticket_id.as_str()) == Some(ticket_id) {
+                let symbol = entry.symbol.clone();
+                drop(entry);
+                self.get_or_create(&symbol).on_close_confirmed(ticket_id);
+                return Ok(());
+            }
+            for wave in &entry.waves {
+                if wave.ticket_id == ticket_id {
+                    let symbol = entry.symbol.clone();
+                    drop(entry);
+                    self.get_or_create(&symbol).on_close_confirmed(ticket_id);
+                    return Ok(());
+                }
+            }
+            for hedge in &entry.hedges {
+                if hedge.ticket_id == ticket_id {
+                    let symbol = entry.symbol.clone();
+                    drop(entry);
+                    self.get_or_create(&symbol).on_close_confirmed(ticket_id);
+                    return Ok(());
+                }
+            }
+        }
+
+        warn!("Fill confirmation for unknown ticket_id: {}", ticket_id);
+        Ok(())
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // REDIS HELPERS
+    // ═════════════════════════════════════════════════════════════════════════
+
+    async fn get_current_price(&self, symbol: &str) -> Result<f64> {
+        let client = redis::Client::open(self.redis_url.as_str())?;
+        let mut conn = client.get_async_connection().await?;
+
+        let key = format!("market:ticker:{}", symbol);
+        let raw: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+
+        match raw {
+            Some(json_str) => {
+                let data: serde_json::Value = serde_json::from_str(&json_str)?;
+                let price = data["last_price"].as_f64()
+                    .or_else(|| data["lastPrice"].as_f64())
+                    .unwrap_or(0.0);
+                Ok(price)
+            }
+            None => Ok(0.0),
+        }
+    }
+
+    async fn get_available_margin(&self) -> f64 {
+        let client = match redis::Client::open(self.redis_url.as_str()) {
+            Ok(c) => c,
+            Err(_) => return 1000.0,
+        };
+
+        let mut conn = match client.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => return 1000.0,
+        };
+
+        let raw: Option<String> = match redis::cmd("GET").arg("neo:portfolio_summary").query_async(&mut conn).await {
+            Ok(v) => v,
+            Err(_) => return 1000.0,
+        };
+
+        match raw {
+            Some(json_str) => {
+                let data: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+                data["available_margin"].as_f64()
+                    .or_else(|| data["availableBalance"].as_f64())
+                    .unwrap_or(1000.0)
+            }
+            None => 1000.0,
+        }
+    }
+
+    async fn get_qty_step(&self, symbol: &str) -> f64 {
+        let client = match redis::Client::open(self.redis_url.as_str()) {
+            Ok(c) => c,
+            Err(_) => return self.default_qty_step,
+        };
+
+        let mut conn = match client.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => return self.default_qty_step,
+        };
+
+        let key = format!("market:instrument:{}", symbol);
+        let raw: Option<String> = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
+            Ok(v) => v,
+            Err(_) => return self.default_qty_step,
+        };
+
+        match raw {
+            Some(json_str) => {
+                let data: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+                data["qty_step"].as_f64()
+                    .or_else(|| data["lotSizeFilter"]["qtyStep"].as_f64())
+                    .unwrap_or(self.default_qty_step)
+            }
+            None => self.default_qty_step,
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // EXECUTION PUBLISHING
+    // ═════════════════════════════════════════════════════════════════════════
+
+    async fn send_execution_payload(
+        &self,
+        symbol: &str,
+        payload: &ExecutionPayload,
+    ) -> Result<()> {
+        if let Err(e) = self.execution_tx.try_send(payload.clone()) {
+            warn!("Execution channel full: {}", e);
+        }
+
+        let client = redis::Client::open(self.redis_url.as_str())?;
+        let mut conn = client.get_async_connection().await?;
+
+        let key = format!("execution:payload:{}", symbol);
+        let json = serde_json::to_string(payload)?;
+
+        redis::cmd("PUBLISH").arg(&key).arg(&json).query_async::<_, ()>(&mut conn).await?;
+        redis::cmd("PUBLISH").arg("execution:payloads").arg(&json).query_async::<_, ()>(&mut conn).await?;
+
+        info!(
+            "EXECUTION PAYLOAD | {} {} {} qty={} | core={} wave={} hedge={} tier={} | {}",
+            symbol, payload.side, payload.order_type, payload.qty,
+            payload.is_core, payload.is_wave_add, payload.is_hedge,
+            payload.hedge_tier, payload.reason
+        );
+
+        Ok(())
+    }
+
+    /// Get a full snapshot of all symbol states for monitoring
+    pub fn full_snapshot(&self) -> serde_json::Value {
+        let mut symbols = serde_json::Map::new();
+        for entry in self.states.iter() {
+            symbols.insert(entry.symbol.clone(), entry.value().snapshot());
+        }
+        serde_json::json!({
+            "symbols": symbols,
+            "symbol_count": self.states.len(),
+            "cached_margin": self.cached_available_margin(),
+            "timestamp": chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Publish portfolio snapshot to Redis for UI consumption
+    pub async fn publish_snapshot(&self) -> Result<()> {
+        let client = redis::Client::open(self.redis_url.as_str())?;
+        let mut conn = client.get_async_connection().await?;
+        let snapshot = self.full_snapshot();
+        redis::cmd("SETEX")
+            .arg("neo:portfolio_snapshot")
+            .arg("5")
+            .arg(snapshot.to_string())
+            .query_async::<_, ()>(&mut conn)
+            .await?;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Wiring Notes for main.rs
+// =============================================================================
+//
+// In main.rs, add:
+//
+//   mod portfolio_state;
+//   use portfolio_state::{PortfolioStateManager, ExecutionPayload};
+//
+// Then in Ingester::run(), after spawning the processor task:
+//
+//   let (exec_tx, exec_rx) = flume::unbounded::<ExecutionPayload>();
+//   let psm = Arc::new(PortfolioStateManager::new(
+//       self.config.redis_url.clone(), exec_tx
+//   ));
+//
+//   // Spawn decision loop
+//   let psm_decision = psm.clone();
+//   tokio::spawn(async move {
+//       if let Err(e) = psm_decision.run_decision_loop().await {
+//           error!("Portfolio decision loop ended: {:?}", e);
+//       }
+//   });
+//
+//   // Spawn risk loop
+//   let psm_risk = psm.clone();
+//   tokio::spawn(async move {
+//       if let Err(e) = psm_risk.run_risk_loop().await {
+//           error!("Portfolio risk loop ended: {:?}", e);
+//       }
+//   });
+//
+//   // Spawn fill listener
+//   let psm_fill = psm.clone();
+//   tokio::spawn(async move {
+//       if let Err(e) = psm_fill.run_fill_listener().await {
+//           error!("Portfolio fill listener ended: {:?}", e);
+//       }
+//   });

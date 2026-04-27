@@ -46,6 +46,7 @@ class HybridVolumeTrailingStop:
         self.highest_vwap = 0.0
         self.lowest_vwap = float('inf')
         self.peak_volume_rate = 0.0
+        self.symbol_vol_profile = {}  # populated from Rust tensor or Redis: {'atr_pct': 0.012, 'avg_vol': 1e6, 'is_high_beta': True, ...}
         
         # ── Execution State ──
         self.is_triggered = False
@@ -67,15 +68,35 @@ class HybridVolumeTrailingStop:
 
         self._lock = threading.RLock()
 
-    def ingest_tick(self, current_price: float, tick_volume: float) -> bool:
-        """
-        Feed live tick data into the tracker.
-        Returns True if the stop-loss has been breached.
+    def _get_adaptive_trail_pct(self, current_price: float, tick_volume: float, rust_metrics: dict = None) -> float:
+        """Helper to calculate the dynamic trail percentage based on volume and ATR."""
+        import math
+        base = self.config.base_trail_pct  # e.g. 0.008 for BTC, 0.003 for PEPE
 
-        Self-detects S/R breakouts and pullbacks internally — no external data needed.
-        Side-effect: sets self.pullback_entry_signal = True when a volume-confirmed
-        breakout retraces to the anchored VWAP (caller consumes and resets to False).
-        """
+        if rust_metrics:
+            vol_ratio = tick_volume / (rust_metrics.get("avg_vol_20", 100000.0) + 1)
+            near_sr = rust_metrics.get("near_sr_strength", 0.0)  
+
+            if rust_metrics.get("vol_indicates_breakout", False) and vol_ratio > 1.8:
+                base = min(base * 2.2, 0.06)  # widen to follow through
+            elif near_sr > 0.7:
+                base = max(0.0025, base * 0.65)  # tighten near S/R
+
+            # Volume surge widens to avoid wick-outs
+            if self.config.dynamic_expansion and vol_ratio > 2.0:
+                base *= (1.0 + math.log1p(vol_ratio - 1.0) * 0.6)
+
+        # Symbol-aware floor/ceiling clamps
+        symbol_upper = self.symbol.upper()
+        if "BTC" in symbol_upper:
+            base = max(base, 0.006)   # min ~0.6% for BTC
+        elif any(x in symbol_upper for x in ["PEPE", "DOGE", "SHIB"]):
+            base = min(base, 0.004)   # tighter max for memes
+
+        return max(0.0025, min(base, 0.08))  # absolute hard clamps
+
+    def ingest_tick(self, current_price: float, tick_volume: float, rust_metrics: dict = None) -> bool:
+        """Main tick processor. Returns True if the trailing stop is triggered."""
         with self._lock:
             if self.is_triggered:
                 return True
@@ -94,6 +115,7 @@ class HybridVolumeTrailingStop:
             self.cum_pv += current_price * tick_volume
             self.cum_vol += tick_volume
             current_vwap = self.vwap
+            
             self._vol_ema = (
                 self._vol_ema_alpha * tick_volume
                 + (1.0 - self._vol_ema_alpha) * self._vol_ema
@@ -110,8 +132,9 @@ class HybridVolumeTrailingStop:
                 if current_vwap < self.lowest_vwap:
                     self.lowest_vwap = current_vwap
 
-            # 4. Self-detecting S/R breakout & pullback (no external data needed)
+            # 4. Self-detecting S/R breakout & pullback
             _is_vol_surge = self._vol_ema > 0 and tick_volume > self._vol_ema * 2.2
+            
             if self.config.direction == TrailingDirection.LONG:
                 _new_extreme  = current_price > old_highest
                 _near_extreme = current_price >= self.highest_price * 0.998
@@ -126,9 +149,9 @@ class HybridVolumeTrailingStop:
                 # New extreme confirmed by institutional volume → follow the breakout
                 self._enter_breakout_follow_internal(current_price, current_vwap)
             elif (_near_extreme and not _new_extreme
-                    and not _is_vol_surge
-                    and not self._near_extreme_tightened
-                    and not self._breakout_active):
+                  and not _is_vol_surge
+                  and not self._near_extreme_tightened
+                  and not self._breakout_active):
                 # Drifting near the extreme without volume conviction → reversal risk → tighten once
                 self.config.base_trail_pct = max(0.003, self.config.base_trail_pct * 0.7)
                 self._near_extreme_tightened = True
@@ -141,18 +164,15 @@ class HybridVolumeTrailingStop:
                         self._pullback_signal_fired = True
                         self.pullback_entry_signal  = True
 
-            # 5. Calculate Dynamic Stop Distances
-            dynamic_trail_pct = self.config.base_trail_pct
-            if self.config.dynamic_expansion and self.peak_volume_rate > 0:
-                vol_ratio = tick_volume / self.peak_volume_rate
-                expansion_factor = 1.0 + math.log1p(vol_ratio) * 0.5
-                dynamic_trail_pct = self.config.base_trail_pct * min(2.0, expansion_factor)
+            # 5. Calculate Dynamic Stop Distances using the cleanly separated helper
+            dynamic_trail_pct = self._get_adaptive_trail_pct(current_price, tick_volume, rust_metrics)
 
-            # 6. Check Triggers (Dual-Threat)
+            # 6. Check Triggers (Dual-Threat: Price & VWAP)
             if self.config.direction == TrailingDirection.LONG:
                 price_stop = self.highest_price * (1.0 - dynamic_trail_pct)
                 vwap_stop  = self.highest_vwap  * (1.0 - self.config.vwap_trail_pct)
                 self.current_stop_price = max(price_stop, vwap_stop)
+                
                 if current_price <= self.current_stop_price:
                     self.is_triggered   = True
                     self.trigger_reason = "VWAP_BREACH" if self.current_stop_price == vwap_stop else "PRICE_RETRACE"
@@ -161,6 +181,7 @@ class HybridVolumeTrailingStop:
                 price_stop = self.lowest_price * (1.0 + dynamic_trail_pct)
                 vwap_stop  = self.lowest_vwap  * (1.0 + self.config.vwap_trail_pct)
                 self.current_stop_price = min(price_stop, vwap_stop)
+                
                 if current_price >= self.current_stop_price:
                     self.is_triggered   = True
                     self.trigger_reason = "VWAP_BREACH" if self.current_stop_price == vwap_stop else "PRICE_RETRACE"

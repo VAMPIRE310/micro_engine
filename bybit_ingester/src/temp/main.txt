@@ -1,0 +1,693 @@
+use std::sync::Arc;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use axum::{
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
+    routing::get,
+    Router,
+};
+use chrono::Utc;
+use dashmap::DashMap;
+use flume::{bounded, Sender, Receiver};
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio::time::interval;
+use tracing::{info, warn, error};
+use futures_util::future::join_all;
+use uuid::Uuid; 
+
+mod websocket;
+mod orderbook;
+mod metrics;
+mod portfolio_state;
+mod timeframe_agg; 
+
+use websocket::{BybitWebSocket, fetch_all_symbols};
+use orderbook::OrderbookManager;
+use metrics::Metrics;
+use crate::timeframe_agg::{TimeframeAggregator, BatchedAggregator};
+use crate::portfolio_state::{PortfolioStateManager, ExecutionPayload};
+
+/// Market data message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MarketMessage {
+    #[serde(rename = "tick")]
+    Tick {
+        symbol: String,
+        price: f64,
+        size: f64,
+        side: String,
+        timestamp: i64,
+    },
+    #[serde(rename = "orderbook")]
+    Orderbook {
+        symbol: String,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+        timestamp: i64,
+        update_type: String,
+    },
+    #[serde(rename = "trade")]
+    Trade {
+        symbol: String,
+        price: f64,
+        size: f64,
+        side: String,
+        timestamp: i64,
+    },
+    #[serde(rename = "kline")]
+    Kline {
+        symbol: String,
+        timeframe: String,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: f64,
+        timestamp: i64,
+    },
+}
+
+/// Configuration
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub redis_url: String,
+    pub max_symbols: usize,
+    pub symbol_offset: usize,
+    pub message_buffer_size: usize,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+            max_symbols: std::env::var("MAX_SYMBOLS")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()
+                .unwrap_or(0),
+            symbol_offset: std::env::var("SYMBOL_OFFSET")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()
+                .unwrap_or(0),
+            message_buffer_size: std::env::var("MESSAGE_BUFFER_SIZE")
+                .unwrap_or_else(|_| "10000".to_string())
+                .parse()
+                .unwrap_or(10000),
+        })
+    }
+}
+
+/// Shared state between components
+pub struct SharedState {
+    pub orderbooks: OrderbookManager,
+    pub recent_trades: DashMap<String, VecDeque<TradeInfo>>,
+    pub metrics: Metrics,
+    pub last_ob_publish: DashMap<String, Instant>,
+    
+    pub mtf_aggregator: Arc<BatchedAggregator>, 
+    pub portfolio_manager: Arc<PortfolioStateManager>,
+    pub active_snipes: DashMap<String, (f64, String)>,
+    pub snipe_cooldown: DashMap<String, Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeInfo {
+    pub price: f64,
+    pub size: f64,
+    pub side: String,
+    pub timestamp: i64,
+}
+
+impl SharedState {
+    pub fn new(redis_url: String, exec_tx: flume::Sender<crate::portfolio_state::ExecutionPayload>) -> Self {
+        let raw_agg = Arc::new(TimeframeAggregator::new());
+        let batched_agg = Arc::new(BatchedAggregator::new(raw_agg, 500));
+        let psm = Arc::new(PortfolioStateManager::new(redis_url, exec_tx));
+        
+        Self {
+            orderbooks: OrderbookManager::new(),
+            recent_trades: DashMap::new(),
+            metrics: Metrics::new(),
+            last_ob_publish: DashMap::new(),
+            mtf_aggregator: batched_agg,
+            portfolio_manager: psm,
+            active_snipes: DashMap::new(),
+            snipe_cooldown: DashMap::new(),
+        }
+    }
+}
+
+/// Redis publisher for market data
+pub struct RedisPublisher {
+    client: redis::aio::MultiplexedConnection,
+    batch: Vec<(String, String)>,
+    batch_size: usize,
+    last_flush: Instant,
+}
+
+impl RedisPublisher {
+    pub async fn new(redis_url: &str) -> Result<Self> {
+        let client = redis::Client::open(redis_url)?;
+        let conn = client.get_multiplexed_async_connection().await?;
+        
+        Ok(Self {
+            client: conn,
+            batch: Vec::with_capacity(1000),
+            batch_size: 100,
+            last_flush: Instant::now(),
+        })
+    }
+    
+    pub async fn publish(&mut self, channel: &str, message: &str) -> Result<()> {
+        self.batch.push((channel.to_string(), message.to_string()));
+        
+        if self.batch.len() >= self.batch_size 
+            || self.last_flush.elapsed() > Duration::from_millis(10) {
+            self.flush().await?;
+        }
+        
+        Ok(())
+    }
+    
+    pub async fn flush(&mut self) -> Result<()> {
+        if self.batch.is_empty() { return Ok(()); }
+        
+        let pipe = redis::pipe();
+        let mut pipe = pipe;
+        
+        for (channel, message) in &self.batch {
+            pipe.cmd("PUBLISH").arg(channel).arg(message);
+        }
+        
+        pipe.query_async::<_, ()>(&mut self.client).await?;
+        
+        self.batch.clear();
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    pub async fn setex(&mut self, key: &str, seconds: usize, value: &str) -> Result<()> {
+        redis::cmd("SETEX").arg(key).arg(seconds).arg(value).query_async::<_, ()>(&mut self.client).await?;
+        Ok(())
+    }
+}
+
+/// Main ingester
+pub struct Ingester {
+    config: Config,
+    state: Arc<SharedState>,
+    message_tx: Sender<MarketMessage>,
+    message_rx: Receiver<MarketMessage>,
+    ws_tx: broadcast::Sender<MarketMessage>,
+}
+
+impl Ingester {
+    pub fn new(config: Config) -> Self {
+        let (tx, rx) = bounded(config.message_buffer_size);
+        let (ws_tx, _) = broadcast::channel(10_000);
+        let (exec_tx, _exec_rx) = flume::unbounded();
+        
+        Self {
+            state: Arc::new(SharedState::new(config.redis_url.clone(), exec_tx)),
+            config,
+            message_tx: tx,
+            message_rx: rx,
+            ws_tx,
+        }
+    }
+    
+    pub async fn run(&self) -> Result<()> {
+        info!("Starting Bybit Ingester (SHARDED ARCHITECTURE)");
+        info!("Redis URL: {}", self.config.redis_url);
+
+        let psm_decision = self.state.portfolio_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = psm_decision.run_decision_loop().await {
+                error!("Portfolio decision loop crashed: {:?}", e);
+            }
+        });
+
+        let psm_risk = self.state.portfolio_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = psm_risk.run_risk_loop().await {
+                error!("Portfolio risk loop crashed: {:?}", e);
+            }
+        });
+
+        let psm_fill = self.state.portfolio_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = psm_fill.run_fill_listener().await {
+                error!("Portfolio fill listener crashed: {:?}", e);
+            }
+        });
+
+        let rx = self.message_rx.clone();
+        let state = self.state.clone();
+        let redis_url = self.config.redis_url.clone();
+        let ws_tx_proc = self.ws_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_processor(rx, state, redis_url, ws_tx_proc).await {
+                error!("Processor error: {}", e);
+            }
+        });
+
+        let ws_tx_axum = self.ws_tx.clone();
+        let app = Router::new()
+            .route("/ws/all", get(ws_handler_all))
+            .route("/ws/:symbol", get(ws_handler))
+            .with_state(ws_tx_axum);
+
+        tokio::spawn(async move {
+            info!("🚀 Fast-Lane WS Server on ws://0.0.0.0:8080 — direct Rust→UI");
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let all_symbols = fetch_all_symbols(self.config.max_symbols).await?;
+        const NUM_SHARDS: usize = 20;
+        let mut chunks: Vec<Vec<String>> = vec![Vec::new(); NUM_SHARDS];
+
+        for (i, symbol) in all_symbols.into_iter().enumerate() {
+            chunks[i % NUM_SHARDS].push(symbol);
+        }
+        chunks.retain(|chunk| !chunk.is_empty());
+        info!("Divided symbols into {} load-balanced shards", chunks.len());
+
+        let mut shard_handles = Vec::with_capacity(chunks.len());
+
+        for (shard_id, symbol_chunk) in chunks.iter().enumerate() {
+            let tx = self.message_tx.clone();
+            let chunk = symbol_chunk.clone();
+
+            let handle = tokio::spawn(async move {
+                let ws = BybitWebSocket::new_with_symbols(chunk, tx);
+                let mut reconnect_count: u64 = 0;
+                let mut last_disconnect = Instant::now();
+
+                loop {
+                    match ws.connect_and_stream(shard_id).await {
+                        Ok(_) => {
+                            reconnect_count += 1;
+                            warn!("[Shard {}] Disconnected cleanly, reconnect #{}", shard_id, reconnect_count);
+                            last_disconnect = Instant::now();
+                        }
+                        Err(e) => {
+                            reconnect_count += 1;
+                            let gap_ms = last_disconnect.elapsed().as_millis();
+                            let backoff_secs = std::cmp::min(2u64.saturating_pow(reconnect_count.min(6) as u32), 60);
+                            
+                            error!("[Shard {}] Error: {} — reconnect #{} (gap={}ms), retry in {}s", shard_id, e, reconnect_count, gap_ms, backoff_secs);
+                            last_disconnect = Instant::now();
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        }
+                    }
+                }
+            });
+            shard_handles.push(handle);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        join_all(shard_handles).await;
+        Ok(())
+    }
+}
+
+async fn run_processor(
+    rx: Receiver<MarketMessage>,
+    state: Arc<SharedState>,
+    redis_url: String,
+    ws_tx: broadcast::Sender<MarketMessage>,
+) -> Result<()> {
+    let mut redis = RedisPublisher::new(&redis_url).await?;
+    let mut flush_interval = interval(Duration::from_millis(10));
+    
+    info!("Message processor started");
+    
+    loop {
+        tokio::select! {
+            Ok(msg) = rx.recv_async() => {
+                let _ = ws_tx.send(msg.clone());
+                process_message(&state, &msg, &mut redis).await?;
+            }
+            _ = flush_interval.tick() => {
+                redis.flush().await?;
+            }
+        }
+    }
+}
+
+async fn process_message(
+    state: &SharedState,
+    msg: &MarketMessage,
+    redis: &mut RedisPublisher,
+) -> Result<()> {
+    let json = serde_json::to_string(msg)?;
+    
+    match msg {
+        MarketMessage::Tick { symbol, price, timestamp, .. } => {
+            redis.publish(&format!("ticks:{}", symbol), &json).await?;
+            state.mtf_aggregator.process_ticker(symbol, *price, *timestamp);
+            state.metrics.increment_tick(symbol);
+            state.portfolio_manager.update_tick_price(symbol, *price);
+            
+            let mut close_and_reverse = false;
+            let mut close_side = String::new();
+            let mut reverse_side = String::new();
+            let mut extreme_val = 0.0;
+            let mut current_pos_idx = 0;
+
+            // Stale-price circuit breaker: abort sniper trail if data >500ms old
+            let price_fresh = state.portfolio_manager.last_price_age_ms(symbol)
+                .map(|age| age <= 500)
+                .unwrap_or(true);
+        
+            if price_fresh {
+                if let Some(mut snipe_data) = state.active_snipes.get_mut(symbol) {
+                let (extreme_price, side) = &mut *snipe_data;
+                let dynamic_threshold = if let Some(ob) = state.orderbooks.get(symbol) {
+                    if let (Some((bid, _)), Some((ask, _))) = (ob.best_bid(), ob.best_ask()) {
+                        let spread_pct = (ask - bid) / ((ask + bid) / 2.0);
+                        spread_pct * 10.0 
+                    } else {
+                        0.002 
+                    }
+                } else {
+                    0.002
+                };
+                
+                if side == "Buy" {
+                    if *price > *extreme_price {
+                        *extreme_price = *price; 
+                    } else {
+                        let drop_pct = (*extreme_price - *price) / *extreme_price;
+                        if drop_pct >= dynamic_threshold { 
+                            tracing::warn!("HFT VOL TRAIL HIT: {} | Peak: {:.4} | Drop: {:.2}%", symbol, *extreme_price, drop_pct * 100.0);
+                            close_and_reverse = true;
+                            close_side = "Sell".to_string();
+                            reverse_side = "Sell".to_string();
+                            extreme_val = *extreme_price;
+                            current_pos_idx = 1;
+                        }
+                    }
+                } else if side == "Sell" {
+                    if *price < *extreme_price {
+                        *extreme_price = *price; 
+                    } else {
+                        let bounce_pct = (*price - *extreme_price) / *extreme_price;
+                        if bounce_pct >= dynamic_threshold { 
+                            tracing::warn!("HFT SHORT TRAIL HIT: {} | Trough: {:.4} | Bounce: {:.2}%", symbol, *extreme_price, bounce_pct * 100.0);
+                            close_and_reverse = true;
+                            close_side = "Buy".to_string();
+                            reverse_side = "Buy".to_string();
+                            extreme_val = *extreme_price;
+                            current_pos_idx = 2;
+                        }
+                    }
+                }
+                }
+            }
+
+            if close_and_reverse {
+                state.active_snipes.remove(symbol);
+
+                let close_payload = ExecutionPayload {
+                    symbol: symbol.to_string(),
+                    side: close_side.clone(),
+                    qty: "0".to_string(), 
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: current_pos_idx, 
+                    reduce_only: true, 
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: false,
+                    is_hedge: false,
+                    hedge_tier: 0,
+                    ticket_id: Uuid::new_v4().to_string(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!("RUST HFT EXIT | Extreme: {:.4}", extreme_val),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                };
+
+                let reverse_qty = 5.0 / *price; 
+                let reverse_idx = if reverse_side == "Buy" { 1 } else { 2 };
+                
+                let reverse_payload = ExecutionPayload {
+                    symbol: symbol.to_string(),
+                    side: reverse_side.clone(),
+                    qty: format!("{:.3}", reverse_qty),
+                    order_type: "Market".to_string(),
+                    price: None,
+                    position_idx: reverse_idx,
+                    reduce_only: false, 
+                    close_on_trigger: false,
+                    is_core: false,
+                    is_wave_add: false,
+                    is_hedge: false,
+                    hedge_tier: 0,
+                    ticket_id: Uuid::new_v4().to_string(),
+                    tp_price: None,
+                    sl_price: None,
+                    reason: format!("RUST HFT REVERSAL | {}", reverse_side),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                };
+
+                if let Ok(c_json) = serde_json::to_string(&close_payload) {
+                    let _ = redis.publish(&format!("execution:payload:{}", symbol), &c_json).await;
+                }
+                if let Ok(r_json) = serde_json::to_string(&reverse_payload) {
+                    let _ = redis.publish(&format!("execution:payload:{}", symbol), &r_json).await;
+                }
+            }
+        }
+        MarketMessage::Orderbook { symbol, bids, asks, timestamp, update_type } => {
+            let is_snapshot = update_type == "snapshot";
+            state.orderbooks.update(symbol, bids.clone(), asks.clone(), *timestamp, is_snapshot);
+            
+            let should_publish = {
+                let now = Instant::now();
+                let mut entry = state.last_ob_publish
+                    .entry(symbol.clone())
+                    .or_insert_with(|| now - Duration::from_secs(1));
+                if now.duration_since(*entry).as_millis() >= 100 {
+                    *entry = now;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            state.metrics.increment_orderbook();
+
+            if should_publish {
+                redis.publish(&format!("orderbooks:{}", symbol), &json).await?;
+                check_volume_anomaly(state, symbol, redis).await?;
+            }
+        }
+        MarketMessage::Trade { symbol, price, size, side, timestamp } => {
+            state.mtf_aggregator.process_trade(symbol, *price, *size, side, *timestamp);
+
+            let trade = TradeInfo {
+                price: *price,
+                size: *size,
+                side: side.clone(),
+                timestamp: *timestamp,
+            };
+            
+            let mut trades = state.recent_trades.entry(symbol.clone()).or_insert_with(VecDeque::new);
+            trades.push_back(trade);
+            if trades.len() > 1000 {
+                trades.pop_front();
+            }
+            
+            state.metrics.increment_trade();
+            redis.publish(&format!("trades:{}", symbol), &json).await?;
+        }
+        MarketMessage::Kline { symbol, timeframe, .. } => {
+            redis.publish(&format!("klines:{}:{}", symbol, timeframe), &json).await?;
+        }
+    }
+
+    let completed_candles = state.mtf_aggregator.drain_pending();
+    for candle in completed_candles {
+        if let Ok(candle_json) = serde_json::to_string(&candle) {
+            redis.publish(&format!("mtf:{}", candle.symbol), &candle_json).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn check_volume_anomaly(
+    state: &SharedState,
+    symbol: &str,
+    redis: &mut RedisPublisher,
+) -> Result<()> {
+    let (volumes, recent_volume) = match state.recent_trades.get(symbol) {
+        Some(trades) if trades.len() >= 100 => {
+            let vols: Vec<f64> = trades.iter().map(|t| t.size).collect();
+            let recent: f64 = trades.iter().rev().take(10).map(|t| t.size).sum::<f64>();
+            (vols, recent)
+        }
+        _ => return Ok(()),
+    };
+    
+    let mean_vol = volumes.iter().sum::<f64>() / volumes.len() as f64;
+    let variance = volumes.iter().map(|v| (v - mean_vol).powi(2)).sum::<f64>() / volumes.len() as f64;
+    let std_vol = variance.sqrt();
+    let z_score: f64 = (recent_volume - mean_vol) / (std_vol + 1e-10);
+    
+    if z_score.abs() > 3.0 {
+        let direction = if z_score > 0.0 { "pump" } else { "dump" };
+        let anomaly = serde_json::json!({
+            "type": "volume_anomaly",
+            "symbol": symbol,
+            "z_score": z_score,
+            "direction": direction,
+            "recent_volume": recent_volume,
+            "mean_volume": mean_vol,
+            "timestamp": Utc::now().timestamp_millis(),
+        });
+        redis.publish("anomalies:volume", &anomaly.to_string()).await?;
+    }
+
+    // Stale-price circuit breaker: block sniper entry if data >500ms old
+    if let Some(age_ms) = state.portfolio_manager.last_price_age_ms(symbol) {
+        if age_ms > 500 {
+            tracing::warn!("HFT sniper entry blocked on {} — stale price ({}ms)", symbol, age_ms);
+            return Ok(());
+        }
+    }
+
+    // --- HFT SNIPER ENTRY LOGIC ---
+    if z_score.abs() > 4.0 { 
+        let now = Instant::now();
+        let mut on_cooldown = false;
+        
+        if let Some(mut last_snipe) = state.snipe_cooldown.get_mut(symbol) {
+            if now.duration_since(*last_snipe).as_secs() < 300 { 
+                on_cooldown = true;
+            } else {
+                *last_snipe = now;
+            }
+        } else {
+            state.snipe_cooldown.insert(symbol.to_string(), now);
+        }
+
+        if !on_cooldown {
+            if let Some(ob) = state.orderbooks.get(symbol) {
+                let bid_vol: f64 = ob.bids.iter().take(5).map(|(_, s)| s).sum();
+                let ask_vol: f64 = ob.asks.iter().take(5).map(|(_, s)| s).sum();
+                
+                if let Some(current_price) = ob.mid_price() {
+                    let mut execute_trade = false;
+                    let mut trade_side = String::new();
+                    
+                    if z_score > 4.0 && bid_vol > (ask_vol * 3.0) {
+                        tracing::warn!("HFT PUMP SNIPE: {} | Z: {:.2}", symbol, z_score);
+                        trade_side = "Buy".to_string();
+                        execute_trade = true;
+                    } 
+                    else if z_score < -4.0 && ask_vol > (bid_vol * 3.0) {
+                        tracing::warn!("HFT DUMP SNIPE: {} | Z: {:.2}", symbol, z_score);
+                        trade_side = "Sell".to_string();
+                        execute_trade = true;
+                    }
+
+                    if execute_trade {
+                        state.active_snipes.insert(symbol.to_string(), (current_price, trade_side.clone()));
+                        
+                        let snipe_qty = 5.0 / current_price; 
+                        
+                        let payload = ExecutionPayload {
+                            symbol: symbol.to_string(),
+                            side: trade_side.clone(),
+                            qty: format!("{:.3}", snipe_qty), 
+                            order_type: "Market".to_string(),
+                            price: None,
+                            position_idx: if trade_side == "Buy" { 1 } else { 2 },
+                            reduce_only: false,
+                            close_on_trigger: false,
+                            is_core: false,
+                            is_wave_add: false,
+                            is_hedge: false,
+                            hedge_tier: 0,
+                            ticket_id: Uuid::new_v4().to_string(),
+                            tp_price: None,
+                            sl_price: None,
+                            reason: format!("RUST HFT ENTRY | Z {:.2} | {}", z_score, trade_side),
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                        };
+                        
+                        if let Ok(payload_json) = serde_json::to_string(&payload) {
+                            let _ = redis.publish(&format!("execution:payload:{}", symbol), &payload_json).await;
+                            
+                            // --- LOCK OUT THE PYTHON AI FOR 5 MINUTES ---
+                            let _ = redis.setex(&format!("pump_dump:active:{}", symbol), 300, "1").await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Path(target_symbol): Path<String>,
+    State(tx): State<broadcast::Sender<MarketMessage>>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, target_symbol, tx))
+}
+
+async fn handle_socket(mut socket: WebSocket, target_symbol: String, tx: broadcast::Sender<MarketMessage>) {
+    let mut rx = tx.subscribe();
+    while let Ok(msg) = rx.recv().await {
+        let msg_symbol = match &msg {
+            MarketMessage::Tick     { symbol, .. } => symbol,
+            MarketMessage::Trade    { symbol, .. } => symbol,
+            MarketMessage::Orderbook{ symbol, .. } => symbol,
+            MarketMessage::Kline    { symbol, .. } => symbol,
+        };
+        if msg_symbol == &target_symbol {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(WsMessage::Text(json)).await.is_err() { break; }
+            }
+        }
+    }
+}
+
+async fn ws_handler_all(
+    ws: WebSocketUpgrade,
+    State(tx): State<broadcast::Sender<MarketMessage>>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_socket_all(socket, tx))
+}
+
+async fn handle_socket_all(mut socket: WebSocket, tx: broadcast::Sender<MarketMessage>) {
+    let mut rx = tx.subscribe();
+    while let Ok(msg) = rx.recv().await {
+        if let Ok(json) = serde_json::to_string(&msg) {
+            if socket.send(WsMessage::Text(json)).await.is_err() { break; }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("bybit_ingester=debug").init();
+    let config = Config::from_env()?;
+    let ingester = Ingester::new(config);
+    ingester.run().await?;
+    Ok(())
+}
